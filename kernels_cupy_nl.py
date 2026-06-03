@@ -213,7 +213,7 @@ def compute_f_int_cupy(
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)  # (chunk, 24)
         u_local = u_gpu[dofs]                     # (chunk, 24)
-        E0_chunk = E0_elem_gpu[start:end]         # (chunk,)
+        E0_chunk = E0_elem_gpu[start:end].astype(cp.float32)  # (chunk,) — E0 stored as fp16
 
         f_loc = cp.zeros((chunk, 24), dtype=cp.float32)
 
@@ -282,7 +282,7 @@ def matvec_tangent_cupy(
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)
         u_local = u_gpu[dofs]   # (chunk, 24) — defines tangent moduli
         v_local = v_gpu[dofs]   # (chunk, 24) — vector to multiply
-        E0_chunk = E0_elem_gpu[start:end]
+        E0_chunk = E0_elem_gpu[start:end].astype(cp.float32)  # E0 stored as fp16
 
         Kv_loc = cp.zeros((chunk, 24), dtype=cp.float32)
 

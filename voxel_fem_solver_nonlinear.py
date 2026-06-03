@@ -26,11 +26,12 @@ Constitutive models (via ConstitutiveModel):
   hardening : E_t = E0 · (1 + beta · eps_vm^n)
 
 GPU memory (300M elements, 48 GB VRAM):
-  E0_elem (float32): 1.1 GB
-  u, Δu, f_int, R, p, z (6 × 3.4 GB): 20.4 GB
+  E0_elem (float16, always): 0.56 GB
+  u, Δu (bfloat16 when half_precision=True): 3.4 GB
+  f_int, R, p, z (float32 always): 13.6 GB
   Tangent matvec working buffers: ~4 GB
   Multigrid coarse levels: ~1.5 GB
-  Total: ~27 GB ✓
+  Total (half_precision=True): ~23 GB ✓
 
 Example
 -------
@@ -160,6 +161,10 @@ class VoxelFEMSolverNonlinear:
     max_pcg_iter : int — max PCG iterations per NR step (default 200)
     preconditioner : str — "multigrid" or "jacobi" (default "multigrid")
     gpu_chunk_size : int — elements per GPU chunk (default 2_000_000)
+    half_precision : bool — store u, delta_u, p (PCG direction) as bfloat16 to
+        halve their VRAM footprint; E0_elem is always stored as float16.
+        All arithmetic is still performed in float32; the reduced-precision
+        vectors are upcast before every matvec and dot product.  Default False.
     verbose : bool — print NR/PCG progress (default True)
     """
 
@@ -179,6 +184,7 @@ class VoxelFEMSolverNonlinear:
         max_pcg_iter: int = 200,
         preconditioner: str = "multigrid",
         gpu_chunk_size: int = 2_000_000,
+        half_precision: bool = False,
         verbose: bool = True,
     ):
         assert voxels.ndim == 3 and voxels.dtype == np.uint8, \
@@ -197,6 +203,8 @@ class VoxelFEMSolverNonlinear:
         self.max_pcg_iter = max_pcg_iter
         self.preconditioner = preconditioner
         self.gpu_chunk_size = gpu_chunk_size
+        self.half_precision = half_precision
+        self._hp = cp.bfloat16 if half_precision else cp.float32
         self.verbose = verbose
         self.pcg_print_interval = 10
         self._kappa_probe = 20
@@ -225,7 +233,7 @@ class VoxelFEMSolverNonlinear:
             E0_cpu = voxels.ravel().astype(np.float32) * E_scale + E_void
 
         self.E_max = E_max
-        self.E0_elem_gpu = cp.asarray(E0_cpu)
+        self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float16)
 
         # Precompute B_gauss matrices (CPU, then GPU)
         if verbose:
@@ -307,17 +315,17 @@ class VoxelFEMSolverNonlinear:
         if hasattr(self._precond, "set_bc_mask"):
             self._precond.set_bc_mask(self.bc_mask)
 
-        u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
+        u_gpu = cp.zeros(self.Ndof, dtype=self._hp)
 
         for step in range(1, self.n_load_steps + 1):
             lf = step / self.n_load_steps    # load fraction
 
-            # Scale BCs and external forces for this step
+            # Scale BCs and external forces for this step (always float32)
             bc_step_gpu = lf * bc_values_gpu
             f_target_gpu = lf * f_ext_total_gpu
 
             # Enforce displacement BCs at this load fraction
-            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu]
+            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
 
             if self.verbose:
                 print(f"\n=== Load step {step}/{self.n_load_steps} "
@@ -327,7 +335,7 @@ class VoxelFEMSolverNonlinear:
                 u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu
             )
 
-        return cp.asnumpy(u_gpu)
+        return cp.asnumpy(u_gpu.astype(cp.float32))
 
     def _nr_step(self, u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu):
         """One load step: NR loop, or single PCG when is_linear=True."""
@@ -342,8 +350,11 @@ class VoxelFEMSolverNonlinear:
         f_norm_ref = None
 
         for k in range(self.max_nr_iter):
+            # Upcast solution to float32 for all arithmetic this iteration
+            u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
+
             f_int = compute_f_int_cupy(
-                u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
+                u_f32, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
                 self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
                 chunk_size=self.gpu_chunk_size,
             )
@@ -375,10 +386,8 @@ class VoxelFEMSolverNonlinear:
             # Update frozen-tangent multigrid for current u
             self._precond.update(u_gpu)
 
-            # Closure over current u for the tangent matvec
-            u_snapshot = u_gpu
-
-            def _matvec(v_gpu, _u=u_snapshot):
+            # Closure over float32 snapshot of u for the tangent matvec
+            def _matvec(v_gpu, _u=u_f32):
                 return matvec_tangent_cupy(
                     v_gpu, _u, self.E0_elem_gpu, self.B_gauss_gpu,
                     self.w_gauss_gpu, self.nu, self.constitutive,
@@ -393,12 +402,12 @@ class VoxelFEMSolverNonlinear:
             delta_u = self._pcg_gpu(
                 _matvec, R, _apply_precond, bc_mask_gpu,
                 tol=eta, max_iter=self.max_pcg_iter,
-                verbose=self.verbose,
+                verbose=self.verbose, storage_dtype=self._hp,
             )
 
-            u_gpu = u_gpu + delta_u
+            u_gpu = (u_f32 + delta_u.astype(cp.float32)).astype(self._hp)
             # Enforce BC values (safeguard against floating-point drift)
-            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu]
+            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
 
             R_norm_prev = R_norm
 
@@ -417,8 +426,10 @@ class VoxelFEMSolverNonlinear:
         PCG is solved to tolerance.  This path skips the NR overhead entirely
         and uses tol_pcg directly instead of the Eisenstat-Walker criterion.
         """
+        u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
+
         f_int = compute_f_int_cupy(
-            u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
+            u_f32, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
             self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
             chunk_size=self.gpu_chunk_size,
         )
@@ -438,9 +449,7 @@ class VoxelFEMSolverNonlinear:
         # Build preconditioner once (no update needed — K is constant for linear)
         self._precond.update(u_gpu)
 
-        u_snap = u_gpu
-
-        def _matvec(v, _u=u_snap):
+        def _matvec(v, _u=u_f32):
             return matvec_tangent_cupy(
                 v, _u, self.E0_elem_gpu, self.B_gauss_gpu,
                 self.w_gauss_gpu, self.nu, self.constitutive,
@@ -451,11 +460,11 @@ class VoxelFEMSolverNonlinear:
         delta_u = self._pcg_gpu(
             _matvec, R, self._precond.apply, bc_mask_gpu,
             tol=self.tol_pcg, max_iter=self.max_pcg_iter,
-            verbose=self.verbose,
+            verbose=self.verbose, storage_dtype=self._hp,
         )
 
-        u_gpu = u_gpu + delta_u
-        u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu]
+        u_gpu = (u_f32 + delta_u.astype(cp.float32)).astype(self._hp)
+        u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
         return u_gpu
 
     def _ew_tolerance(self, R_norm, R_norm_prev):
@@ -471,12 +480,14 @@ class VoxelFEMSolverNonlinear:
         return max(eta, self.tol_nr / 10.0)
 
     def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu,
-                 tol=1e-6, max_iter=200, verbose=False):
+                 tol=1e-6, max_iter=200, verbose=False,
+                 storage_dtype=cp.float32):
         """
         Preconditioned Conjugate Gradient with GPU-resident vectors.
 
-        u, r, p, z remain on GPU throughout; residual norm is synced to CPU
-        at each iteration for the convergence check.
+        r and Ap stay float32 for convergence accuracy.  x and p are stored in
+        storage_dtype (float32 or bfloat16); they are upcast before every matvec
+        and dot product so arithmetic precision is unaffected.
 
         Parameters
         ----------
@@ -484,30 +495,35 @@ class VoxelFEMSolverNonlinear:
         b_gpu  : (Ndof,) float32 CuPy — right-hand side
         precond : callable (Ndof,)→(Ndof,) — preconditioner M^{-1}
         bc_mask_gpu : (Ndof,) bool CuPy — constrained DOFs
+        storage_dtype : cp dtype — storage dtype for x and p (default float32)
         """
         free_gpu = ~bc_mask_gpu
 
-        x = cp.zeros_like(b_gpu)
+        x = cp.zeros(b_gpu.shape[0], dtype=storage_dtype)
 
         def _Kfree(v):
-            """K·v with identity rows for constrained DOFs."""
+            """K·v with identity rows for constrained DOFs (v must be float32)."""
             w = matvec(v)
             w[bc_mask_gpu] = v[bc_mask_gpu]
             return w
 
         def _Mfree(r):
-            """M^{-1}·r, zeroed at constrained DOFs."""
+            """M^{-1}·r, zeroed at constrained DOFs (returns float32)."""
             z = precond(r)
             if isinstance(z, np.ndarray):
                 z = cp.asarray(z, dtype=cp.float32)
             z[bc_mask_gpu] = 0.0
             return z
 
-        r = b_gpu - _Kfree(x)
+        # r and Ap stay float32 throughout (convergence accuracy).
+        # x and p are stored in storage_dtype; upcast before every operation.
+        x_f32 = cp.zeros(b_gpu.shape[0], dtype=cp.float32)
+        r = b_gpu - _Kfree(x_f32)
         r[bc_mask_gpu] = 0.0
 
-        z = _Mfree(r)
-        p = z.copy()
+        z = _Mfree(r)          # float32
+        p = z.astype(storage_dtype)
+        x[:] = x_f32.astype(storage_dtype)
         rz = float(cp.dot(r, z).get())
         r0 = float(cp.dot(b_gpu[free_gpu], b_gpu[free_gpu]).get()) + 1e-30
 
@@ -521,16 +537,17 @@ class VoxelFEMSolverNonlinear:
 
         res = 1.0
         for it in range(max_iter):
-            Ap = _Kfree(p)
-            pAp = float(cp.dot(p, Ap).get())
+            p_f32 = p.astype(cp.float32)
+            Ap = _Kfree(p_f32)                          # float32
+            pAp = float(cp.dot(p_f32, Ap).get())
             alpha = rz / (pAp + 1e-30)
             alphas.append(alpha)
 
-            x += alpha * p
-            r -= alpha * Ap
+            x = (x.astype(cp.float32) + alpha * p_f32).astype(storage_dtype)
+            r -= alpha * Ap                              # float32 in-place
             r[bc_mask_gpu] = 0.0
 
-            z = _Mfree(r)
+            z = _Mfree(r)                               # float32
             rz_new = float(cp.dot(r, z).get())
 
             r_free = r[free_gpu]
@@ -566,7 +583,7 @@ class VoxelFEMSolverNonlinear:
 
             beta = rz_new / (rz + 1e-30)
             betas.append(beta)
-            p = z + beta * p
+            p = (z + beta * p_f32).astype(storage_dtype)
             rz = rz_new
         else:
             print(f"    ⚠ PCG did NOT converge: {max_iter} iters, "

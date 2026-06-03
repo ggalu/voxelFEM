@@ -99,14 +99,20 @@ class NonlinearMultigrid:
         """
         Ne = int(self.E0_elem_gpu.shape[0])
 
+        # Upcast reduced-precision inputs to float32 for computation
+        u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
+        E0_f32 = (self.E0_elem_gpu.astype(cp.float32)
+                  if self.E0_elem_gpu.dtype != cp.float32
+                  else self.E0_elem_gpu)
+
         # Average von Mises strain per element (over 8 Gauss points)
         eps_vm_avg = compute_avg_strain_per_element(
-            u_gpu, self.B_gauss_gpu, self.Ny, self.Nz, Ne,
+            u_f32, self.B_gauss_gpu, self.Ny, self.Nz, Ne,
             chunk_size=self.chunk_size
         )
 
         # Tangent modulus at current state
-        E_t = self.constitutive.tangent_modulus(self.E0_elem_gpu, eps_vm_avg)
+        E_t = self.constitutive.tangent_modulus(E0_f32, eps_vm_avg)
 
         # Map to uint8 relative to E_max for coarsening
         E_t_cpu = cp.asnumpy(E_t)
