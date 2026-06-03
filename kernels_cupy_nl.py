@@ -84,6 +84,7 @@ def _get_elem_dofs(elem_ids_gpu, Ny, Nz):
     j_e = (elem_ids_gpu // Nz) % Ny
     k_e = elem_ids_gpu % Nz
     n0 = i_e * si + j_e * sj + k_e  # (chunk,)
+    del i_e, j_e, k_e
 
     # Local node ordering matches geometry.element_node_ids:
     # node 0=(i,j,k) 1=(i+1,j,k) 2=(i+1,j+1,k) 3=(i,j+1,k)
@@ -93,10 +94,33 @@ def _get_elem_dofs(elem_ids_gpu, Ny, Nz):
         dtype=cp.int32
     )
     nodes = n0[:, None] + node_offsets[None, :]  # (chunk, 8)
+    del n0
 
     # 3 DOFs per node, interleaved: [3n, 3n+1, 3n+2]
     dofs = nodes[:, :, None] * 3 + cp.arange(3, dtype=cp.int32)[None, None, :]
+    del nodes
     return dofs.reshape(-1, 24)  # (chunk, 24)
+
+
+def _build_D_ref(nu):
+    """
+    Build the unit-modulus isotropic D matrix, (6, 6) float32 CuPy array.
+
+    D_t for a chunk = E_t[:, None, None] * D_ref[None, :, :], but callers
+    in the hot path fuse E_t scaling into a matmul instead of materialising
+    the (chunk, 6, 6) tensor.
+    """
+    c1 = (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    c2 = nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+    c3 = 1.0 / (2.0 * (1.0 + nu))
+    return cp.array([
+        [c1, c2, c2,  0,  0,  0],
+        [c2, c1, c2,  0,  0,  0],
+        [c2, c2, c1,  0,  0,  0],
+        [ 0,  0,  0, c3,  0,  0],
+        [ 0,  0,  0,  0, c3,  0],
+        [ 0,  0,  0,  0,  0, c3],
+    ], dtype=cp.float32)
 
 
 def build_D_cupy(E_t, nu):
@@ -114,18 +138,7 @@ def build_D_cupy(E_t, nu):
     -------
     D : (chunk, 6, 6) float32 CuPy array
     """
-    c1 = (1.0 - nu) / ((1.0 + nu) * (1.0 - 2.0 * nu))
-    c2 = nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
-    c3 = 1.0 / (2.0 * (1.0 + nu))
-    D_ref = cp.array([
-        [c1, c2, c2,  0,  0,  0],
-        [c2, c1, c2,  0,  0,  0],
-        [c2, c2, c1,  0,  0,  0],
-        [ 0,  0,  0, c3,  0,  0],
-        [ 0,  0,  0,  0, c3,  0],
-        [ 0,  0,  0,  0,  0, c3],
-    ], dtype=cp.float32)
-    return E_t[:, None, None] * D_ref[None, :, :]  # (chunk, 6, 6)
+    return E_t[:, None, None] * _build_D_ref(nu)[None, :, :]  # (chunk, 6, 6)
 
 
 def von_mises_strain(eps):
@@ -206,12 +219,16 @@ def compute_f_int_cupy(
     Ne = int(E0_elem_gpu.shape[0])
     f_int = cp.zeros(Ndof, dtype=cp.float32)
 
+    # Build unit-modulus D_ref once (6×6) — avoids allocating (chunk,6,6) D_t
+    D_ref = _build_D_ref(nu)
+
     for start in range(0, Ne, chunk_size):
         end = min(start + chunk_size, Ne)
         chunk = end - start
 
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)  # (chunk, 24)
+        del elem_ids
         u_local = u_gpu[dofs]                     # (chunk, 24)
         E0_chunk = E0_elem_gpu[start:end].astype(cp.float32)  # (chunk,) — E0 stored as fp16
 
@@ -224,18 +241,24 @@ def compute_f_int_cupy(
             # Strain: eps[c,i] = Σ_j B[i,j] * u_local[c,j]
             eps = cp.einsum('ij,cj->ci', B, u_local)  # (chunk, 6)
 
-            eps_vm = von_mises_strain(eps)                          # (chunk,)
-            E_t = constitutive.tangent_modulus(E0_chunk, eps_vm)    # (chunk,)
-            D_t = build_D_cupy(E_t, nu)                             # (chunk, 6, 6)
+            # Compute D_ref @ eps before eps_vm to reuse memory
+            D_ref_eps = cp.einsum('ij,cj->ci', D_ref, eps)  # (chunk, 6)
+            eps_vm = von_mises_strain(eps)                   # (chunk,)
+            del eps
+            E_t = constitutive.tangent_modulus(E0_chunk, eps_vm)  # (chunk,)
+            del eps_vm
 
-            # Cauchy stress: sigma[c,i] = Σ_j D_t[c,i,j] * eps[c,j]
-            sigma = cp.einsum('cij,cj->ci', D_t, eps)  # (chunk, 6)
+            # Cauchy stress: sigma = E_t * (D_ref @ eps)  — no (chunk,6,6) D_t
+            sigma = E_t[:, None] * D_ref_eps  # (chunk, 6)
+            del E_t, D_ref_eps
 
-            # Internal force: f[c,j] = Σ_i B[i,j] * sigma[c,i]  (= B^T @ sigma per element)
-            f_loc += w * (sigma @ B)  # (chunk, 6) @ (6, 24) = (chunk, 24)
+            # Internal force: f[c,j] += w * Σ_i B[i,j] * sigma[c,i]
+            f_loc += w * (sigma @ B)  # (chunk, 24)
+            del sigma
 
         # Atomic scatter-add to global f_int (handles repeated DOF indices)
         cp.add.at(f_int, dofs.ravel(), f_loc.ravel())
+        del dofs, u_local, E0_chunk, f_loc
 
     return f_int
 
@@ -274,12 +297,16 @@ def matvec_tangent_cupy(
     Ne = int(E0_elem_gpu.shape[0])
     Kv = cp.zeros(Ndof, dtype=cp.float32)
 
+    # Build unit-modulus D_ref once (6×6) — avoids allocating (chunk,6,6) D_t
+    D_ref = _build_D_ref(nu)
+
     for start in range(0, Ne, chunk_size):
         end = min(start + chunk_size, Ne)
         chunk = end - start
 
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)
+        del elem_ids
         u_local = u_gpu[dofs]   # (chunk, 24) — defines tangent moduli
         v_local = v_gpu[dofs]   # (chunk, 24) — vector to multiply
         E0_chunk = E0_elem_gpu[start:end].astype(cp.float32)  # E0 stored as fp16
@@ -290,22 +317,28 @@ def matvec_tangent_cupy(
             B = B_gauss_gpu[gp]
             w = float(w_gauss_gpu[gp])
 
-            # Strain from u at this Gauss point — determines tangent moduli
+            # Tangent moduli from u at this Gauss point
             eps_u = cp.einsum('ij,cj->ci', B, u_local)    # (chunk, 6)
             eps_vm = von_mises_strain(eps_u)
+            del eps_u
             E_t = constitutive.tangent_modulus(E0_chunk, eps_vm)
-            D_t = build_D_cupy(E_t, nu)                    # (chunk, 6, 6)
+            del eps_vm
 
             # Strain from v (test vector)
             eps_v = cp.einsum('ij,cj->ci', B, v_local)    # (chunk, 6)
 
-            # D_t @ B @ v per element
-            D_eps_v = cp.einsum('cij,cj->ci', D_t, eps_v)  # (chunk, 6)
+            # D_t @ eps_v = E_t * (D_ref @ eps_v)  — no (chunk,6,6) D_t
+            D_ref_eps_v = cp.einsum('ij,cj->ci', D_ref, eps_v)  # (chunk, 6)
+            del eps_v
+            scaled = E_t[:, None] * D_ref_eps_v  # (chunk, 6)
+            del E_t, D_ref_eps_v
 
             # B^T @ D_t @ B @ v
-            Kv_loc += w * (D_eps_v @ B)  # (chunk, 24)
+            Kv_loc += w * (scaled @ B)  # (chunk, 24)
+            del scaled
 
         cp.add.at(Kv, dofs.ravel(), Kv_loc.ravel())
+        del dofs, u_local, v_local, E0_chunk, Kv_loc
 
     return Kv
 
@@ -412,14 +445,17 @@ def compute_avg_strain_per_element(u_gpu, B_gauss_gpu, Ny, Nz, Ne,
 
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)
+        del elem_ids
         u_local = u_gpu[dofs]  # (chunk, 24)
 
         eps_vm_sum = cp.zeros(chunk, dtype=cp.float32)
         for gp in range(8):
             B = B_gauss_gpu[gp]
             eps = cp.einsum('ij,cj->ci', B, u_local)
-            eps_vm_sum = eps_vm_sum + von_mises_strain(eps)
+            eps_vm_sum += von_mises_strain(eps)  # in-place: avoids new allocation
+            del eps
 
         eps_vm_avg[start:end] = eps_vm_sum / 8.0
+        del dofs, u_local, eps_vm_sum
 
     return eps_vm_avg

@@ -123,7 +123,10 @@ class NonlinearMultigrid:
         if int(E_t_voxels.max()) == 0:
             E_t_voxels = self.base_voxels.copy()
 
-        # Rebuild multigrid hierarchy with updated effective moduli
+        # Free old hierarchy before building the new one so they don't coexist.
+        del self._gmg
+        cp.get_default_memory_pool().free_all_blocks()
+
         self._gmg = GeometricMultigrid(
             E_t_voxels, self.nu, self.E_max, self.E_void,
             n_levels=self.n_levels, n_pre=self.n_pre, n_post=self.n_post,

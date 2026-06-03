@@ -305,9 +305,22 @@ class VoxelFEMSolverNonlinear:
         u : (Ndof,) float32 NumPy array — final displacement field
         """
         bc_mask_gpu = cp.asarray(self.bc_mask)
-        bc_values_gpu = cp.asarray(self.bc_values)
-        f_ext_total_gpu = cp.asarray(self._f_ext)
         free_gpu = ~bc_mask_gpu
+
+        # Sparse BC storage: indices and values for constrained DOFs only.
+        # Avoids uploading dense bc_values (Ndof) and bc_step (Ndof) arrays.
+        bc_dofs_np = np.where(self.bc_mask)[0].astype(np.int32)
+        bc_dofs_gpu = cp.asarray(bc_dofs_np)
+        bc_vals_gpu = cp.asarray(self.bc_values[self.bc_mask].astype(np.float32))
+
+        # Sparse external force storage (typically zero for displacement control).
+        _has_forces = bool(np.any(self._f_ext != 0))
+        if _has_forces:
+            f_nz = np.where(self._f_ext != 0)[0].astype(np.int32)
+            force_dofs_gpu = cp.asarray(f_nz)
+            force_vals_gpu = cp.asarray(self._f_ext[f_nz].astype(np.float32))
+        else:
+            force_dofs_gpu = force_vals_gpu = None
 
         # Multigrid coarse operators are singular without the BCs that anchor
         # the rigid-body modes; hand the preconditioner the constrained mask
@@ -320,33 +333,29 @@ class VoxelFEMSolverNonlinear:
         for step in range(1, self.n_load_steps + 1):
             lf = step / self.n_load_steps    # load fraction
 
-            # Scale BCs and external forces for this step (always float32)
-            bc_step_gpu = lf * bc_values_gpu
-            f_target_gpu = lf * f_ext_total_gpu
-
-            # Enforce displacement BCs at this load fraction
-            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
+            # Enforce displacement BCs at this load fraction (sparse scatter)
+            u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
 
             if self.verbose:
                 print(f"\n=== Load step {step}/{self.n_load_steps} "
                       f"(fraction={lf:.3f}) ===")
 
             u_gpu = self._nr_step(
-                u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu
+                u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
+                force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu,
             )
 
         return cp.asnumpy(u_gpu.astype(cp.float32))
 
-    def _nr_step(self, u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu):
+    def _nr_step(self, u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
+                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
         """One load step: NR loop, or single PCG when is_linear=True."""
         if self.is_linear:
-            return self._linear_step(u_gpu, f_target_gpu, bc_mask_gpu,
-                                     bc_step_gpu, free_gpu)
+            return self._linear_step(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu,
+                                     bc_vals_gpu, force_dofs_gpu, force_vals_gpu,
+                                     _has_forces, free_gpu)
 
         R_norm_prev = None
-
-        # Reference norm for relative convergence: use ||f_int_0|| at k=0 as
-        # normalization (works for both force- and displacement-controlled problems)
         f_norm_ref = None
 
         for k in range(self.max_nr_iter):
@@ -359,17 +368,22 @@ class VoxelFEMSolverNonlinear:
                 chunk_size=self.gpu_chunk_size,
             )
 
-            R = f_target_gpu - f_int
-            R[bc_mask_gpu] = 0.0
-
-            R_norm = float(cp.linalg.norm(R[free_gpu]).get())
-
-            # Set reference norm from first iteration
+            # Capture norms before converting f_int to R in-place
             if f_norm_ref is None:
-                f_norm_ext = float(cp.linalg.norm(f_target_gpu[free_gpu]).get())
                 f_norm_int = float(cp.linalg.norm(f_int[free_gpu]).get())
+                f_norm_ext = (lf * float(cp.linalg.norm(force_vals_gpu).get())
+                              if _has_forces else 0.0)
                 f_norm_ref = max(f_norm_ext, f_norm_int, 1e-30)
 
+            # Build R = f_ext - f_int in-place in f_int's buffer (saves 1 Ndof alloc)
+            cp.negative(f_int, out=f_int)           # f_int ← -f_int
+            if _has_forces:
+                cp.add.at(f_int, force_dofs_gpu, lf * force_vals_gpu)
+            f_int[bc_mask_gpu] = 0.0
+            R = f_int
+            del f_int                               # drop alias; buffer lives via R
+
+            R_norm = float(cp.linalg.norm(R[free_gpu]).get())
             rel_res = R_norm / f_norm_ref
 
             if self.verbose:
@@ -400,14 +414,19 @@ class VoxelFEMSolverNonlinear:
 
             # Inner PCG solve: K_t(u) · Δu = R
             delta_u = self._pcg_gpu(
-                _matvec, R, _apply_precond, bc_mask_gpu,
+                _matvec, R, _apply_precond, bc_mask_gpu, free_gpu,
                 tol=eta, max_iter=self.max_pcg_iter,
                 verbose=self.verbose, storage_dtype=self._hp,
             )
+            del R
 
-            u_gpu = (u_f32 + delta_u.astype(cp.float32)).astype(self._hp)
+            # Update u in-place: upcast → add → downcast
+            u_f32 += delta_u.astype(cp.float32)
+            del delta_u
+            u_gpu = u_f32.astype(self._hp)
+            del u_f32
             # Enforce BC values (safeguard against floating-point drift)
-            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
+            u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
 
             R_norm_prev = R_norm
 
@@ -417,7 +436,8 @@ class VoxelFEMSolverNonlinear:
 
         return u_gpu
 
-    def _linear_step(self, u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu):
+    def _linear_step(self, u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
+                     force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
         """
         Single-pass linear solve: one PCG at tight tolerance, no NR loop.
 
@@ -433,13 +453,22 @@ class VoxelFEMSolverNonlinear:
             self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
             chunk_size=self.gpu_chunk_size,
         )
-        R = f_target_gpu - f_int
-        R[bc_mask_gpu] = 0.0
+
+        # Capture norms before converting f_int to R in-place
+        f_norm_int = float(cp.linalg.norm(f_int[free_gpu]).get())
+        f_norm_ext = (lf * float(cp.linalg.norm(force_vals_gpu).get())
+                      if _has_forces else 0.0)
+        f_norm_ref = max(f_norm_int, f_norm_ext, 1e-30)
+
+        # Build R = f_ext - f_int in-place in f_int's buffer
+        cp.negative(f_int, out=f_int)
+        if _has_forces:
+            cp.add.at(f_int, force_dofs_gpu, lf * force_vals_gpu)
+        f_int[bc_mask_gpu] = 0.0
+        R = f_int
+        del f_int
 
         R_norm = float(cp.linalg.norm(R[free_gpu]).get())
-        f_norm_int = float(cp.linalg.norm(f_int[free_gpu]).get())
-        f_norm_ext = float(cp.linalg.norm(f_target_gpu[free_gpu]).get())
-        f_norm_ref = max(f_norm_int, f_norm_ext, 1e-30)
 
         if self.verbose:
             print(f"  Linear solve: ||R|| = {R_norm:.3e}  "
@@ -458,13 +487,17 @@ class VoxelFEMSolverNonlinear:
             )
 
         delta_u = self._pcg_gpu(
-            _matvec, R, self._precond.apply, bc_mask_gpu,
+            _matvec, R, self._precond.apply, bc_mask_gpu, free_gpu,
             tol=self.tol_pcg, max_iter=self.max_pcg_iter,
             verbose=self.verbose, storage_dtype=self._hp,
         )
+        del R
 
-        u_gpu = (u_f32 + delta_u.astype(cp.float32)).astype(self._hp)
-        u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu].astype(self._hp)
+        u_f32 += delta_u.astype(cp.float32)
+        del delta_u
+        u_gpu = u_f32.astype(self._hp)
+        del u_f32
+        u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
         return u_gpu
 
     def _ew_tolerance(self, R_norm, R_norm_prev):
@@ -479,7 +512,7 @@ class VoxelFEMSolverNonlinear:
         eta = min(0.5, R_norm / (R_norm_prev + 1e-30))
         return max(eta, self.tol_nr / 10.0)
 
-    def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu,
+    def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu, free_gpu,
                  tol=1e-6, max_iter=200, verbose=False,
                  storage_dtype=cp.float32):
         """
@@ -495,10 +528,9 @@ class VoxelFEMSolverNonlinear:
         b_gpu  : (Ndof,) float32 CuPy — right-hand side
         precond : callable (Ndof,)→(Ndof,) — preconditioner M^{-1}
         bc_mask_gpu : (Ndof,) bool CuPy — constrained DOFs
+        free_gpu : (Ndof,) bool CuPy — ~bc_mask_gpu, passed in to avoid recompute
         storage_dtype : cp dtype — storage dtype for x and p (default float32)
         """
-        free_gpu = ~bc_mask_gpu
-
         x = cp.zeros(b_gpu.shape[0], dtype=storage_dtype)
 
         def _Kfree(v):
@@ -515,15 +547,12 @@ class VoxelFEMSolverNonlinear:
             z[bc_mask_gpu] = 0.0
             return z
 
-        # r and Ap stay float32 throughout (convergence accuracy).
-        # x and p are stored in storage_dtype; upcast before every operation.
-        x_f32 = cp.zeros(b_gpu.shape[0], dtype=cp.float32)
-        r = b_gpu - _Kfree(x_f32)
+        # x=0 → K·x=0 → r = b − 0 = b. Copy b; zero constrained DOFs.
+        r = b_gpu.copy()
         r[bc_mask_gpu] = 0.0
 
         z = _Mfree(r)          # float32
         p = z.astype(storage_dtype)
-        x[:] = x_f32.astype(storage_dtype)
         rz = float(cp.dot(r, z).get())
         r0 = float(cp.dot(b_gpu[free_gpu], b_gpu[free_gpu]).get()) + 1e-30
 
@@ -543,8 +572,14 @@ class VoxelFEMSolverNonlinear:
             alpha = rz / (pAp + 1e-30)
             alphas.append(alpha)
 
-            x = (x.astype(cp.float32) + alpha * p_f32).astype(storage_dtype)
+            # Update x in-place to avoid a large intermediate allocation
+            x_f32 = x.astype(cp.float32)
+            x_f32 += alpha * p_f32
+            x = x_f32.astype(storage_dtype)
+            del x_f32
+
             r -= alpha * Ap                              # float32 in-place
+            del Ap
             r[bc_mask_gpu] = 0.0
 
             z = _Mfree(r)                               # float32
@@ -552,6 +587,7 @@ class VoxelFEMSolverNonlinear:
 
             r_free = r[free_gpu]
             res = float(cp.sqrt(cp.dot(r_free, r_free) / r0).get())
+            del r_free
             res_history.append(res)
 
             # Condition number estimate after kappa_probe iterations
@@ -579,11 +615,15 @@ class VoxelFEMSolverNonlinear:
 
             if res < tol:
                 print(f"    PCG converged at iter {it},  residual = {res:.3e}")
+                del p_f32, z
                 break
 
             beta = rz_new / (rz + 1e-30)
             betas.append(beta)
-            p = (z + beta * p_f32).astype(storage_dtype)
+            # Update p in-place on z to avoid a large intermediate
+            z += beta * p_f32
+            p = z.astype(storage_dtype)
+            del p_f32, z
             rz = rz_new
         else:
             print(f"    ⚠ PCG did NOT converge: {max_iter} iters, "

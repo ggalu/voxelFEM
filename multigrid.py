@@ -317,12 +317,13 @@ class GeometricMultigrid:
         return e.reshape(-1).astype(np.float32)
 
     def _smooth(self, level: GridLevel, u: np.ndarray, f: np.ndarray,
-                n_iter: int) -> np.ndarray:
+                n_iter: int, copy_input: bool = True) -> np.ndarray:
         """
         Damped Jacobi smoother: u ← u + ω · D⁻¹ · (f − K·u)
         """
         omega = 0.67
-        u = u.copy()
+        if copy_input:
+            u = u.copy()
 
         for _ in range(n_iter):
             r = f - level.matvec(u)
@@ -346,13 +347,15 @@ class GeometricMultigrid:
 
         coarse = self.levels[level_idx + 1]
 
-        # Pre-smooth
-        e = self._smooth(level, self.xp.zeros_like(r), r, self.n_pre)
+        # Pre-smooth (zeros_like is freshly allocated — no copy needed)
+        e = self._smooth(level, self.xp.zeros_like(r), r, self.n_pre,
+                         copy_input=False)
 
         # Restrict residual; zero constrained coarse DOFs (full weighting mixes
         # in free neighbours, so the coarse residual must be re-masked).
         r_res = r - level.matvec(e)
         r_coarse = self._restrict(r_res, level, coarse)
+        del r_res   # free fine-level residual before recursion and post-smooth
         if coarse.bc_mask is not None:
             r_coarse[coarse.bc_mask] = 0.0
 
@@ -364,9 +367,10 @@ class GeometricMultigrid:
         if level.bc_mask is not None:
             e_correction[level.bc_mask] = 0.0
         e = e + e_correction
+        del e_correction
 
-        # Post-smooth
-        e = self._smooth(level, e, r, self.n_post)
+        # Post-smooth (e is freshly allocated above — no copy needed)
+        e = self._smooth(level, e, r, self.n_post, copy_input=False)
 
         return e
 
