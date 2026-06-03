@@ -59,6 +59,13 @@ regression first. The single most important test is
 `(f_int(u+hv) − f_int(u))/h ≈ K_t(u)·v`. If it fails, the NR solver will not
 converge.
 
+## Git workflow
+
+**Always commit and push directly to the default `main` branch.** Do not create
+feature branches for this project — commit straight onto `main` and `git push
+origin main`. (This overrides the usual "branch first off the default branch"
+convention.)
+
 ## Architecture
 
 ### The solver: `VoxelFEMSolverNonlinear` (`voxel_fem_solver_nonlinear.py`)
@@ -416,9 +423,26 @@ Profiling note: the bottleneck was *not* the GPU↔CPU transfer (~0.2% of
 chiefly `matvec_Ku`'s `np.add.at` scatter. The GPU port (`matvec_Ku_cupy` /
 `build_diagonal_cupy`, implicit connectivity + `cp.add.at`) cut `example_layered`
 `solve()` by ~2.6× at 40³ and ~15× at 80³ (per-V-cycle ~22× faster at 80³); the
-gap widens with problem size. Remaining headroom on small grids is GPU
-kernel-launch overhead (the V-cycle issues many small per-level kernels), which
-amortises away at the target scale.
+gap widens with problem size.
+
+**`example_layered.py` total run time** (full process: import + CUDA init + two
+solves, normal & parallel; VTK disabled). BEFORE = CPU V-cycle (commit
+`8a0c2e9`), AFTER = GPU V-cycle:
+
+| Size | Voxels  | BEFORE   | AFTER  | Speedup       |
+|------|---------|----------|--------|---------------|
+| 20³  | 8,000   | 2.68 s   | 4.90 s | 0.55× (slower)|
+| 40³  | 64,000  | 17.58 s  | 5.01 s | 3.5×          |
+| 60³  | 216,000 | 41.98 s  | 6.20 s | 6.8×          |
+| 80³  | 512,000 | 129.11 s | 9.79 s | 13.2×         |
+
+BEFORE scales with element count; AFTER stays nearly flat (4.9 → 9.8 s over a
+64× voxel increase) because it is dominated by fixed per-process overhead, not
+the V-cycle. The crossover is ~40³: below it (e.g. 20³) the GPU version is
+slower — at that scale the V-cycle is trivial either way and the run is
+dominated by CUDA-context init, GPU hierarchy setup, and one-time CuPy kernel
+JIT compilation. This per-process / kernel-launch overhead amortises away at
+the target scale; the totals converge toward the solve-only speedup as N grows.
 
 ### Multigrid fix history (for reference)
 
