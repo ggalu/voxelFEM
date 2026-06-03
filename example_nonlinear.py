@@ -2,7 +2,7 @@
 """
 Nonlinear Voxel FEM Solver — Example
 ======================================
-Demonstrates VoxelFEMSolverNonlinear on an 80³ uniform block under 1%
+Demonstrates VoxelFEMSolverNonlinear on a uniform cube (default 40³) under 1%
 uniaxial tensile strain in the z-direction, comparing two material models:
 
   1. Linear elasticity     — baseline, no stiffness change with strain
@@ -16,8 +16,10 @@ Reports:
 
 Usage:
     python example_nonlinear.py
+    python example_nonlinear.py --size 80 --preconditioner jacobi
 """
 
+import argparse
 import time
 import numpy as np
 import cupy as cp
@@ -142,7 +144,8 @@ class TrackedSolver(VoxelFEMSolverNonlinear):
 # ---------------------------------------------------------------------------
 
 def run_model(name, constitutive, Nx, Ny, Nz, nu, E_max, E_void,
-              n_load_steps, tol_nr, max_pcg_iter, disp_frac):
+              n_load_steps, tol_nr, max_pcg_iter, disp_frac,
+              preconditioner="multigrid"):
     """
     Solve uniaxial tension problem with the given constitutive model.
 
@@ -166,7 +169,7 @@ def run_model(name, constitutive, Nx, Ny, Nz, nu, E_max, E_void,
         max_nr_iter=15,
         tol_nr=tol_nr,
         max_pcg_iter=max_pcg_iter,
-        preconditioner="jacobi",      # fast for this problem size
+        preconditioner=preconditioner,
         gpu_chunk_size=2_000_000,
         verbose=False,                # TrackedSolver prints its own output
     )
@@ -261,8 +264,18 @@ def print_results(name, u, elapsed, per_step_times, Nx, Ny, Nz, disp_frac):
 # ---------------------------------------------------------------------------
 
 def main():
+    p = argparse.ArgumentParser(
+        description="Nonlinear voxel FEM uniaxial-tension example")
+    p.add_argument("--size", type=int, default=40,
+                   help="grid side length N (N x N x N voxels), default 40")
+    p.add_argument("--preconditioner", choices=["multigrid", "jacobi"],
+                   default="multigrid",
+                   help="PCG preconditioner (default multigrid)")
+    args = p.parse_args()
+
     # Problem parameters
-    N          = 80          # grid size
+    N          = args.size   # grid size
+    precond    = args.preconditioner
     nu         = 0.3         # Poisson ratio
     E_max      = 1.0         # Young's modulus at voxel=255
     E_void     = 1e-6        # void modulus
@@ -272,7 +285,7 @@ def main():
     max_pcg    = 200         # max PCG iterations per NR step
 
     print("=" * 70)
-    print("  NONLINEAR VOXEL FEM — 80³ UNIAXIAL TENSION EXAMPLE")
+    print(f"  NONLINEAR VOXEL FEM — {N}³ UNIAXIAL TENSION EXAMPLE")
     print("=" * 70)
     free, total = vram_free_total_gb()
     print(f"  GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
@@ -280,6 +293,7 @@ def main():
     print(f"  Grid: {N}³ = {N**3:,} elements")
     print(f"  DOFs: {3*(N+1)**3:,}")
     print(f"  Applied strain: {disp_frac*100:.1f}%  ({n_steps} load steps)")
+    print(f"  Preconditioner: {precond}")
 
     results = {}
 
@@ -295,6 +309,7 @@ def main():
         "Linear elasticity",
         mat_linear, N, N, N, nu, E_max, E_void,
         n_steps, tol_nr, max_pcg, disp_frac,
+        preconditioner=precond,
     )
     results["Linear"] = (u_lin, t_lin, steps_lin)
     print_results("Linear elasticity", u_lin, t_lin, steps_lin, N, N, N, disp_frac)
@@ -313,6 +328,7 @@ def main():
         "Power-law hardening  (β=50, n=0.5)",
         mat_hard, N, N, N, nu, E_max, E_void,
         n_steps, tol_nr, max_pcg, disp_frac,
+        preconditioner=precond,
     )
     results["Hardening"] = (u_hard, t_hard, steps_hard)
     print_results("Power-law hardening", u_hard, t_hard, steps_hard, N, N, N, disp_frac)
