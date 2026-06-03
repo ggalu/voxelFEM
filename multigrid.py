@@ -10,10 +10,22 @@ from geometry import (
     build_node_index, element_node_ids, build_K_ref, matvec_Ku, build_diagonal
 )
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    CUPY_AVAILABLE = False
+
 
 class GridLevel:
     """
     Holds data for one multigrid level.
+
+    Backend-parametric: with ``xp is np`` everything runs on the CPU (the
+    reference path the pure-NumPy tests exercise); with ``xp is cupy`` the level
+    operator and Jacobi diagonal are GPU-resident and use implicit connectivity
+    (``conn_dof`` is never stored — required for the 300M-voxel budget).
     """
     def __init__(
         self,
@@ -23,9 +35,13 @@ class GridLevel:
         E_void: float,
         nu: float,
         stiffness_scale: float = 1.0,
+        xp=np,
+        chunk_size: int = 2_000_000,
     ):
+        self.xp = xp
+        self.chunk_size = chunk_size
         self.Nx, self.Ny, self.Nz = Nx, Ny, Nz
-        self.voxels = voxels.copy()
+        self.voxels = voxels.copy()           # CPU image (used for coarsening)
 
         # Build DOF mapping
         Nn = (Nx + 1) * (Ny + 1) * (Nz + 1)
@@ -37,21 +53,32 @@ class GridLevel:
         # operator must be scaled (stiffness_scale = 2^level) to approximate the
         # Galerkin operator P^T A P. Without it the V-cycle over-corrects.
         E_scale = (E_max - E_void) / 255.0
-        self.E_elem = ((voxels.ravel().astype(np.float32) * E_scale + E_void)
-                       * np.float32(stiffness_scale))
+        E_elem_cpu = ((voxels.ravel().astype(np.float32) * E_scale + E_void)
+                      * np.float32(stiffness_scale))
+        K_ref_cpu = build_K_ref(nu)           # (24, 24) float64
 
-        # Build reference element stiffness (same for all levels)
-        self.K_ref = build_K_ref(nu)
+        if xp is np:
+            # ----- CPU reference path (unchanged numerics) -----
+            self.E_elem = E_elem_cpu
+            self.K_ref = K_ref_cpu
+            node_idx = build_node_index(Nx, Ny, Nz)
+            conn_nodes = element_node_ids(node_idx, Nx, Ny, Nz)
+            self.conn_dof = (conn_nodes[:, :, np.newaxis] * 3
+                            + np.array([0, 1, 2], dtype=np.int32)).reshape(-1, 24)
+            diag = build_diagonal(self.E_elem, self.conn_dof,
+                                  self.K_ref, self.Ndof)
+        else:
+            # ----- GPU path: implicit connectivity, no conn_dof stored -----
+            from kernels_cupy_nl import build_diagonal_cupy
+            self.E_elem = xp.asarray(E_elem_cpu)
+            self.K_ref = xp.asarray(K_ref_cpu.astype(np.float32))
+            self.conn_dof = None
+            diag_ref = xp.asarray(np.diag(K_ref_cpu).astype(np.float32))
+            diag = build_diagonal_cupy(self.E_elem, diag_ref,
+                                       self.Ny, self.Nz, self.Ndof,
+                                       chunk_size=self.chunk_size)
 
-        # Build connectivity
-        node_idx = build_node_index(Nx, Ny, Nz)
-        conn_nodes = element_node_ids(node_idx, Nx, Ny, Nz)
-        self.conn_dof = (conn_nodes[:, :, np.newaxis] * 3
-                        + np.array([0, 1, 2], dtype=np.int32)).reshape(-1, 24)
-
-        # Precompute diagonal for Jacobi smoother
-        diag = build_diagonal(self.E_elem, self.conn_dof, self.K_ref, self.Ndof)
-        diag = np.where(diag < 1e-12, 1.0, diag)
+        diag = xp.where(diag < 1e-12, xp.asarray(1.0, dtype=diag.dtype), diag)
         self.diag_inv = (1.0 / diag).astype(np.float32)
 
         # Essential (Dirichlet) DOFs for this level; set via set_bc(). Without
@@ -65,16 +92,25 @@ class GridLevel:
 
         Constrained DOFs become identity rows in ``matvec`` and are frozen by
         the smoother (``diag_inv = 1`` there), so a homogeneous correction keeps
-        them at zero throughout the V-cycle.
+        them at zero throughout the V-cycle. ``bc_mask`` comes in as a NumPy
+        bool array (masks are derived on the CPU) and is moved to ``xp``.
         """
-        self.bc_mask = bc_mask
-        if bc_mask is not None:
-            self.diag_inv = self.diag_inv.copy()
-            self.diag_inv[bc_mask] = 1.0
+        if bc_mask is None:
+            self.bc_mask = None
+            return
+        self.bc_mask = self.xp.asarray(bc_mask)
+        self.diag_inv = self.diag_inv.copy()
+        self.diag_inv[self.bc_mask] = 1.0
 
-    def matvec(self, u: np.ndarray) -> np.ndarray:
+    def matvec(self, u):
         """Apply K·u for this level (identity rows on constrained DOFs)."""
-        w = matvec_Ku(u, self.E_elem, self.conn_dof, self.K_ref, self.Ndof)
+        if self.xp is np:
+            w = matvec_Ku(u, self.E_elem, self.conn_dof, self.K_ref, self.Ndof)
+        else:
+            from kernels_cupy_nl import matvec_Ku_cupy
+            w = matvec_Ku_cupy(u, self.E_elem, self.K_ref,
+                               self.Ny, self.Nz, self.Ndof,
+                               chunk_size=self.chunk_size)
         if self.bc_mask is not None:
             w[self.bc_mask] = u[self.bc_mask]
         return w
@@ -102,6 +138,12 @@ class GeometricMultigrid:
         Number of post-smoothing iterations (default 2)
     coarse_solver : str
         "cg" or "direct" (default "cg")
+    use_gpu : bool
+        If True, levels are GPU-resident (CuPy, implicit connectivity) and the
+        whole V-cycle runs on the GPU — no per-apply host transfer. If False
+        (default) everything runs on NumPy (the pure-CPU reference path).
+    chunk_size : int
+        Elements per GPU chunk for the level operator (GPU path only).
     """
 
     def __init__(
@@ -115,7 +157,14 @@ class GeometricMultigrid:
         n_post: int = 2,
         coarse_solver: str = "cg",
         bc_mask: np.ndarray = None,
+        use_gpu: bool = False,
+        chunk_size: int = 2_000_000,
     ):
+        if use_gpu and not CUPY_AVAILABLE:
+            raise RuntimeError("use_gpu=True requires CuPy, which is not available")
+        self.xp = cp if use_gpu else np
+        self.use_gpu = use_gpu
+        self.chunk_size = chunk_size
         self.voxels_fine = voxels.copy()
         self.Nx, self.Ny, self.Nz = voxels.shape
         self.nu = nu
@@ -133,7 +182,8 @@ class GeometricMultigrid:
         while True:
             level = GridLevel(img.shape[0], img.shape[1], img.shape[2],
                              img, E_max, E_void, nu,
-                             stiffness_scale=2.0 ** level_idx)
+                             stiffness_scale=2.0 ** level_idx,
+                             xp=self.xp, chunk_size=chunk_size)
             self.levels.append(level)
 
             if n_levels and len(self.levels) >= n_levels:
@@ -225,39 +275,45 @@ class GeometricMultigrid:
 
     def _axis_matrices(self, fine_level: GridLevel,
                        coarse_level: GridLevel):
-        """Per-axis 1-D prolongation matrices for a fine/coarse level pair."""
+        """Per-axis 1-D prolongation matrices for a fine/coarse level pair.
+
+        Built on the CPU (small, pure structure) and moved to ``xp`` so the
+        einsums stay on the active backend.
+        """
         return (
-            self._prolong_matrix_1d(fine_level.Nx, coarse_level.Nx),
-            self._prolong_matrix_1d(fine_level.Ny, coarse_level.Ny),
-            self._prolong_matrix_1d(fine_level.Nz, coarse_level.Nz),
+            self.xp.asarray(self._prolong_matrix_1d(fine_level.Nx, coarse_level.Nx)),
+            self.xp.asarray(self._prolong_matrix_1d(fine_level.Ny, coarse_level.Ny)),
+            self.xp.asarray(self._prolong_matrix_1d(fine_level.Nz, coarse_level.Nz)),
         )
 
-    def _restrict(self, r_fine: np.ndarray, fine_level: GridLevel,
-                  coarse_level: GridLevel) -> np.ndarray:
+    def _restrict(self, r_fine, fine_level: GridLevel,
+                  coarse_level: GridLevel):
         """
         Restrict residual fine → coarse by full weighting, R = P^T.
 
         Applies the transpose of each 1-D prolongation matrix along its axis.
         """
+        xp = self.xp
         Px, Py, Pz = self._axis_matrices(fine_level, coarse_level)
         r = r_fine.reshape(fine_level.Nx + 1, fine_level.Ny + 1,
                            fine_level.Nz + 1, 3)
-        r = np.einsum('ai,abcd->ibcd', Px, r)   # contract fine axis a → coarse i
-        r = np.einsum('bj,ibcd->ijcd', Py, r)
-        r = np.einsum('ck,ijcd->ijkd', Pz, r)
+        r = xp.einsum('ai,abcd->ibcd', Px, r)   # contract fine axis a → coarse i
+        r = xp.einsum('bj,ibcd->ijcd', Py, r)
+        r = xp.einsum('ck,ijcd->ijkd', Pz, r)
         return r.reshape(-1).astype(np.float32)
 
-    def _prolongate(self, e_coarse: np.ndarray, coarse_level: GridLevel,
-                    fine_level: GridLevel) -> np.ndarray:
+    def _prolongate(self, e_coarse, coarse_level: GridLevel,
+                    fine_level: GridLevel):
         """
         Prolongate correction coarse → fine by trilinear interpolation, P.
         """
+        xp = self.xp
         Px, Py, Pz = self._axis_matrices(fine_level, coarse_level)
         e = e_coarse.reshape(coarse_level.Nx + 1, coarse_level.Ny + 1,
                             coarse_level.Nz + 1, 3)
-        e = np.einsum('ai,ijkd->ajkd', Px, e)   # coarse i → fine a
-        e = np.einsum('bj,ajkd->abkd', Py, e)
-        e = np.einsum('ck,abkd->abcd', Pz, e)
+        e = xp.einsum('ai,ijkd->ajkd', Px, e)   # coarse i → fine a
+        e = xp.einsum('bj,ajkd->abkd', Py, e)
+        e = xp.einsum('ck,abkd->abcd', Pz, e)
         return e.reshape(-1).astype(np.float32)
 
     def _smooth(self, level: GridLevel, u: np.ndarray, f: np.ndarray,
@@ -291,7 +347,7 @@ class GeometricMultigrid:
         coarse = self.levels[level_idx + 1]
 
         # Pre-smooth
-        e = self._smooth(level, np.zeros_like(r), r, self.n_pre)
+        e = self._smooth(level, self.xp.zeros_like(r), r, self.n_pre)
 
         # Restrict residual; zero constrained coarse DOFs (full weighting mixes
         # in free neighbours, so the coarse residual must be re-masked).
@@ -314,26 +370,27 @@ class GeometricMultigrid:
 
         return e
 
-    def _cg_solve(self, level: GridLevel, b: np.ndarray, max_iter: int = 50,
-                  tol: float = 1e-6) -> np.ndarray:
+    def _cg_solve(self, level: GridLevel, b, max_iter: int = 50,
+                  tol: float = 1e-6):
         """
         Simple CG solver on the coarsest level.
         """
-        x = np.zeros_like(b)
+        xp = self.xp
+        x = xp.zeros_like(b)
         r = b.copy()
         p = r.copy()
-        rsold = float(np.dot(r, r))
+        rsold = float(xp.dot(r, r))
 
         for it in range(max_iter):
             Ap = level.matvec(p)
-            pAp = float(np.dot(p, Ap))
+            pAp = float(xp.dot(p, Ap))
             alpha = rsold / (pAp + 1e-30)
 
             x += alpha * p
             r -= alpha * Ap
 
-            rsnew = float(np.dot(r, r))
-            if np.sqrt(rsnew) < tol * np.sqrt(rsold + 1e-30):
+            rsnew = float(xp.dot(r, r))
+            if rsnew ** 0.5 < tol * (rsold + 1e-30) ** 0.5:
                 break
 
             beta = rsnew / (rsold + 1e-30)

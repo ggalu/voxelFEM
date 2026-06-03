@@ -21,7 +21,7 @@ incremental load stepping, and **inexact-Newton inner PCG** solves.
 ## Commands
 
 ```bash
-# Run all tests (44 tests). The core kernel/solver tests require CuPy/GPU —
+# Run all tests (47 tests). The core kernel/solver tests require CuPy/GPU —
 # they skip if CuPy is absent; the layered-validation reference and multigrid
 # tests are pure NumPy and always run.
 python -m pytest tests/ -v --tb=short
@@ -53,7 +53,7 @@ python example_layered.py --size 48 --contrast 100 --format vtk
 ```
 
 **After every change to a `.py` file, run the test suite before proceeding.**
-All 44 tests must stay green. **Do not move on if any test fails** — fix the
+All 47 tests must stay green. **Do not move on if any test fails** — fix the
 regression first. The single most important test is
 `test_matvec_tangent_fd_consistency`: it verifies
 `(f_int(u+hv) − f_int(u))/h ≈ K_t(u)·v`. If it fails, the NR solver will not
@@ -189,11 +189,18 @@ raises `RuntimeError` at import if CuPy is absent.
 
 ### Multigrid preconditioner
 
-`multigrid.py` — `GeometricMultigrid`: linear, CPU/NumPy. Hierarchy built by
-repeated 2×2×2 averaging of the voxel image. Prolongation is trilinear
-interpolation (tensor product of 1-D operators); restriction is full weighting,
-`R = P^T` (the exact transpose, so the V-cycle is SPD); smoother is damped
-Jacobi (ω = 0.67); coarsest level solved by CG. Coarse operators are scaled by
+`multigrid.py` — `GeometricMultigrid`: linear, **backend-parametric** (`xp` is
+NumPy or CuPy, chosen by `use_gpu`). With `use_gpu=False` (default) it is the
+pure-NumPy CPU reference the tests exercise; with `use_gpu=True` every level
+operator, the Jacobi diagonal, and the whole V-cycle are GPU-resident (CuPy).
+The GPU level operator (`matvec_Ku_cupy`/`build_diagonal_cupy` in
+`kernels_cupy_nl.py`) uses **implicit connectivity** — `conn_dof` is never
+stored on the GPU path (mandatory for the 300M-voxel budget; the NumPy path
+still stores `conn_dof` as the CPU reference). Hierarchy built by repeated
+2×2×2 averaging of the voxel image. Prolongation is trilinear interpolation
+(tensor product of 1-D operators); restriction is full weighting, `R = P^T`
+(the exact transpose, so the V-cycle is SPD); smoother is damped Jacobi
+(ω = 0.67); coarsest level solved by CG. Coarse operators are scaled by
 `2^level` (3-D elasticity stiffness K ∝ h) so the V-cycle approximates the
 Galerkin operator and does not over-correct.
 
@@ -207,8 +214,9 @@ in `solve()` (via `NonlinearMultigrid.set_bc_mask`) once BCs are known.
 `update(u_gpu)` method (**frozen-tangent strategy**). At each NR iteration it
 computes the per-element average tangent modulus from current `u`, maps it to a
 uint8 image, and rebuilds the `GeometricMultigrid` hierarchy (passing the stored
-`bc_mask`). The V-cycle then runs on CPU; GPU↔CPU transfer happens inside
-`apply()`.
+`bc_mask`). It builds the hierarchy with `use_gpu=True`, so the V-cycle runs
+**entirely on the GPU** and `apply()` consumes/returns a CuPy residual with no
+host round-trip per PCG iteration.
 
 `preconditioner="multigrid"` is now working. On the layered example it converges
 in a near grid-independent ~20–30 PCG iterations vs Jacobi's O(N) (e.g. 40³
@@ -260,7 +268,7 @@ voxel_fem_solver_nonlinear.py ← geometry, kernels_cupy_nl, constitutive, multi
 
 ### Test layout
 
-All tests live in `tests/` (44 total). Each file inserts `sys.path` to find the
+All tests live in `tests/` (47 total). Each file inserts `sys.path` to find the
 parent directory — no `conftest.py`. The GPU tests are guarded with
 `pytestmark = pytest.mark.skipif(not CUPY_AVAILABLE, ...)`, so the suite skips
 cleanly with no GPU. Files:
@@ -274,9 +282,12 @@ cleanly with no GPU. Files:
   `test_regression_to_linear` builds a CPU linear PCG reference from `geometry`
   (`matvec_Ku` + `build_diagonal` + `pcg`) and compares against the nonlinear
   solver with a linear constitutive model.
-- `test_multigrid.py` — pure-NumPy `GeometricMultigrid` correctness: `R = Pᵀ`
-  adjoint property, convergent V-cycle iteration, and PCG-with-multigrid
-  agreement with Jacobi-PCG in fewer iterations. Always runs (no GPU).
+- `test_multigrid.py` — `GeometricMultigrid` correctness. The 3 CPU tests
+  (`R = Pᵀ` adjoint property, convergent V-cycle iteration, PCG-with-multigrid
+  agreement with Jacobi-PCG in fewer iterations) are pure NumPy and always run.
+  3 further GPU-guarded tests cross-validate the CuPy backend against the NumPy
+  reference: `matvec_Ku_cupy` vs `matvec_Ku`, GPU V-cycle `apply()` vs CPU
+  `apply()`, and GPU-multigrid-PCG vs Jacobi-PCG.
 
 ### Analytical validation: layered composite (`tests/validation/`)
 
@@ -392,14 +403,22 @@ Two invariants the writers enforce:
 
 ## Known Issues
 
-### GeometricMultigrid — remaining performance caveat
+### GeometricMultigrid — GPU V-cycle (resolved)
 
 The correctness bugs are **fixed** (see "Multigrid preconditioner" above and
-`tests/test_multigrid.py`). One performance limitation remains:
+`tests/test_multigrid.py`). The earlier CPU-V-cycle performance limitation is
+also **resolved**: the V-cycle is now GPU-resident (`use_gpu=True`,
+backend-parametric `GeometricMultigrid`), so `apply()` no longer round-trips to
+the host per PCG iteration.
 
-- The V-cycle runs on CPU/NumPy, so every PCG iteration transfers the full
-  residual GPU→CPU and the correction CPU→GPU. At large sizes this transfer
-  dominates. Long-term: port the V-cycle to CuPy kernels and keep it GPU-resident.
+Profiling note: the bottleneck was *not* the GPU↔CPU transfer (~0.2% of
+`solve()`) as previously assumed, but the NumPy V-cycle arithmetic itself —
+chiefly `matvec_Ku`'s `np.add.at` scatter. The GPU port (`matvec_Ku_cupy` /
+`build_diagonal_cupy`, implicit connectivity + `cp.add.at`) cut `example_layered`
+`solve()` by ~2.6× at 40³ and ~15× at 80³ (per-V-cycle ~22× faster at 80³); the
+gap widens with problem size. Remaining headroom on small grids is GPU
+kernel-launch overhead (the V-cycle issues many small per-level kernels), which
+amortises away at the target scale.
 
 ### Multigrid fix history (for reference)
 

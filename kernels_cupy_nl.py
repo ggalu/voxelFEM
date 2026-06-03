@@ -310,6 +310,81 @@ def matvec_tangent_cupy(
     return Kv
 
 
+def matvec_Ku_cupy(u_gpu, E_elem_gpu, K_ref_gpu, Ny, Nz, Ndof,
+                   chunk_size=2_000_000):
+    """
+    Linear matrix-free product  f = K·u  with a constant reference stiffness.
+
+    K_e = E_elem[e] · K_ref (same K_ref for every element). This is the operator
+    used by the geometric-multigrid levels — unlike ``matvec_tangent_cupy`` it
+    does not evaluate the constitutive model per Gauss point. GPU-resident,
+    implicit connectivity (conn_dof is never stored).
+
+    Parameters
+    ----------
+    u_gpu : (Ndof,) float32 CuPy
+    E_elem_gpu : (Ne,) float32 CuPy — per-element modulus (already scaled)
+    K_ref_gpu : (24, 24) float32 CuPy — reference element stiffness
+    Ny, Nz : int — grid dimensions of this level
+    Ndof : int
+    chunk_size : int
+
+    Returns
+    -------
+    f : (Ndof,) float32 CuPy
+    """
+    Ne = int(E_elem_gpu.shape[0])
+    f = cp.zeros(Ndof, dtype=cp.float32)
+
+    for start in range(0, Ne, chunk_size):
+        end = min(start + chunk_size, Ne)
+
+        elem_ids = cp.arange(start, end, dtype=cp.int32)
+        dofs = _get_elem_dofs(elem_ids, Ny, Nz)            # (chunk, 24)
+        u_loc = u_gpu[dofs]                                # (chunk, 24)
+
+        # K_ref · u_loc per element, then scale by E_elem
+        Ku_loc = cp.einsum('ij,cj->ci', K_ref_gpu, u_loc)  # (chunk, 24)
+        Ku_loc *= E_elem_gpu[start:end, None]
+
+        cp.add.at(f, dofs.ravel(), Ku_loc.ravel())
+
+    return f
+
+
+def build_diagonal_cupy(E_elem_gpu, diag_ref_gpu, Ny, Nz, Ndof,
+                        chunk_size=2_000_000):
+    """
+    Accumulate diag(K) on the GPU for the Jacobi smoother.
+
+    diag(K_e) = E_elem[e] · diag(K_ref). Implicit connectivity, GPU-resident.
+
+    Parameters
+    ----------
+    E_elem_gpu : (Ne,) float32 CuPy
+    diag_ref_gpu : (24,) float32 CuPy — diag(K_ref)
+    Ny, Nz : int
+    Ndof : int
+    chunk_size : int
+
+    Returns
+    -------
+    diag : (Ndof,) float32 CuPy
+    """
+    Ne = int(E_elem_gpu.shape[0])
+    diag = cp.zeros(Ndof, dtype=cp.float32)
+
+    for start in range(0, Ne, chunk_size):
+        end = min(start + chunk_size, Ne)
+
+        elem_ids = cp.arange(start, end, dtype=cp.int32)
+        dofs = _get_elem_dofs(elem_ids, Ny, Nz)               # (chunk, 24)
+        contrib = E_elem_gpu[start:end, None] * diag_ref_gpu[None, :]
+        cp.add.at(diag, dofs.ravel(), contrib.ravel())
+
+    return diag
+
+
 def compute_avg_strain_per_element(u_gpu, B_gauss_gpu, Ny, Nz, Ne,
                                    chunk_size=2_000_000):
     """

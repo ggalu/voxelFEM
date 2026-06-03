@@ -47,7 +47,7 @@ class NonlinearMultigrid:
     def __init__(self, voxels, nu, E_max, E_void, constitutive,
                  B_gauss_gpu, E0_elem_gpu,
                  n_levels=None, n_pre=2, n_post=2, chunk_size=2_000_000,
-                 bc_mask=None):
+                 bc_mask=None, use_gpu=None):
         self.base_voxels = voxels.copy()
         self.nu = nu
         self.E_max = E_max
@@ -59,6 +59,9 @@ class NonlinearMultigrid:
         self.n_pre = n_pre
         self.n_post = n_post
         self.chunk_size = chunk_size
+        # Run the whole V-cycle on the GPU when CuPy is available, so each PCG
+        # iteration applies the preconditioner without a host round-trip.
+        self.use_gpu = CUPY_AVAILABLE if use_gpu is None else use_gpu
         # Fine-grid constrained-DOF mask; without it the coarse operators are
         # singular and the V-cycle diverges. Set via set_bc_mask() before solve.
         self.bc_mask = bc_mask
@@ -68,7 +71,8 @@ class NonlinearMultigrid:
         # Build initial hierarchy from base voxels (before any deformation)
         self._gmg = GeometricMultigrid(
             voxels, nu, E_max, E_void,
-            n_levels=n_levels, n_pre=n_pre, n_post=n_post, bc_mask=self.bc_mask
+            n_levels=n_levels, n_pre=n_pre, n_post=n_post, bc_mask=self.bc_mask,
+            use_gpu=self.use_gpu, chunk_size=self.chunk_size,
         )
 
     def set_bc_mask(self, bc_mask):
@@ -117,14 +121,13 @@ class NonlinearMultigrid:
         self._gmg = GeometricMultigrid(
             E_t_voxels, self.nu, self.E_max, self.E_void,
             n_levels=self.n_levels, n_pre=self.n_pre, n_post=self.n_post,
-            bc_mask=self.bc_mask
+            bc_mask=self.bc_mask,
+            use_gpu=self.use_gpu, chunk_size=self.chunk_size,
         )
 
     def apply(self, r):
         """
         Apply GMG preconditioner: M^{-1} · r via one V-cycle.
-
-        Handles both CuPy and NumPy input transparently.
 
         Parameters
         ----------
@@ -132,11 +135,20 @@ class NonlinearMultigrid:
 
         Returns
         -------
-        z : (Ndof,) float32 — preconditioned residual (same type as r)
+        z : (Ndof,) float32 — preconditioned residual
+
+        With the GPU backend the V-cycle is fully GPU-resident: a CuPy residual
+        goes straight through with no host transfer. The CPU fallback (and a
+        NumPy residual handed to a GPU hierarchy, or vice-versa) is converted as
+        needed so the call is type-robust.
         """
+        if self.use_gpu:
+            if isinstance(r, cp.ndarray):
+                return self._gmg.apply(r)                       # GPU-resident
+            # NumPy residual into a GPU hierarchy: move it across.
+            return cp.asnumpy(self._gmg.apply(cp.asarray(r, dtype=cp.float32)))
+
+        # CPU hierarchy.
         if CUPY_AVAILABLE and isinstance(r, cp.ndarray):
-            r_cpu = cp.asnumpy(r)
-            z_cpu = self._gmg.apply(r_cpu)
-            return cp.asarray(z_cpu, dtype=cp.float32)
-        else:
-            return self._gmg.apply(r).astype(np.float32)
+            return cp.asarray(self._gmg.apply(cp.asnumpy(r)), dtype=cp.float32)
+        return self._gmg.apply(r).astype(np.float32)

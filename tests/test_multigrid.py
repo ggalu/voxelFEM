@@ -26,6 +26,13 @@ from geometry import (
 )
 from multigrid import GeometricMultigrid
 
+try:
+    import cupy as cp
+    CUPY_AVAILABLE = True
+except ImportError:
+    cp = None
+    CUPY_AVAILABLE = False
+
 
 def _build_problem(N=10, nu=0.3, E_max=1.0, E_void=1e-6):
     """Uniform-voxel cube under uniaxial displacement, with rigid modes anchored."""
@@ -169,3 +176,74 @@ def _pcg(prob, precond, tol=1e-8, max_iter=500):
         p = z + (rz_new / (rz + 1e-30)) * p
         rz = rz_new
     return x, max_iter
+
+
+# ---------------------------------------------------------------------------
+# GPU backend: the CuPy-resident V-cycle must reproduce the NumPy reference.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy/GPU not available")
+def test_gpu_matvec_Ku_matches_numpy_reference():
+    """matvec_Ku_cupy (implicit connectivity) == geometry.matvec_Ku (conn_dof)."""
+    from kernels_cupy_nl import matvec_Ku_cupy
+
+    N, nu = 12, 0.3
+    Ndof = 3 * (N + 1) ** 3
+    K_ref = build_K_ref(nu)
+    node_idx = build_node_index(N, N, N)
+    conn_nodes = element_node_ids(node_idx, N, N, N)
+    conn_dof = (conn_nodes[:, :, None] * 3
+                + np.array([0, 1, 2], dtype=np.int32)).reshape(-1, 24)
+    rng = np.random.default_rng(0)
+    E_elem = rng.uniform(0.1, 1.0, N ** 3).astype(np.float32)
+    u = rng.standard_normal(Ndof).astype(np.float32)
+
+    f_cpu = matvec_Ku(u, E_elem, conn_dof, K_ref, Ndof)
+    f_gpu = matvec_Ku_cupy(
+        cp.asarray(u), cp.asarray(E_elem),
+        cp.asarray(K_ref.astype(np.float32)), N, N, Ndof,
+    ).get()
+
+    assert np.linalg.norm(f_gpu - f_cpu) <= 1e-4 * (np.linalg.norm(f_cpu) + 1e-30)
+
+
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy/GPU not available")
+def test_gpu_vcycle_matches_cpu():
+    """A full GPU V-cycle apply() agrees with the NumPy reference apply()."""
+    prob = _build_problem(N=10)
+    gmg_cpu = _gmg(prob)
+    gmg_gpu = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], use_gpu=True,
+    )
+
+    rng = np.random.default_rng(2)
+    r = rng.standard_normal(prob["Ndof"]).astype(np.float32)
+    r[prob["bc_mask"]] = 0.0
+
+    z_cpu = gmg_cpu.apply(r)
+    z_gpu = gmg_gpu.apply(cp.asarray(r)).get()
+
+    assert np.linalg.norm(z_gpu - z_cpu) <= 1e-4 * (np.linalg.norm(z_cpu) + 1e-30)
+
+
+@pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy/GPU not available")
+def test_gpu_pcg_matches_jacobi():
+    """GPU-multigrid-PCG converges to the same solution as Jacobi-PCG."""
+    prob = _build_problem(N=10)
+    gmg_gpu = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], use_gpu=True,
+    )
+
+    # Wrap the GPU apply so the NumPy reference PCG can call it transparently.
+    def gpu_apply(r):
+        return gmg_gpu.apply(cp.asarray(r)).get()
+
+    x_ref = pcg(prob["matvec"], prob["b"], prob["jac_inv"], prob["bc_mask"],
+                max_iter=500, tol=1e-8, verbose=False)
+    x_m, it_m = _pcg(prob, gpu_apply)
+    x_j, it_j = _pcg(prob, prob["jac_inv"])
+
+    assert np.linalg.norm(x_m - x_ref) / (np.linalg.norm(x_ref) + 1e-30) < 1e-3
+    assert it_m < it_j
