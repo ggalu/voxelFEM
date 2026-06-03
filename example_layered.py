@@ -2,12 +2,16 @@
 """
 Layered Composite — Effective Modulus Example
 =============================================
-Builds a two-phase layered voxel composite, solves it with
-``VoxelFEMSolverNonlinear`` in linear mode, and compares the FEM effective
-Young's modulus against the exact analytic result:
+Builds a two-phase layered voxel composite with alternating E1/E2 slabs,
+solves it with ``VoxelFEMSolverNonlinear`` in linear mode, and compares the
+FEM effective Young's modulus against the exact analytic result:
 
   * loading NORMAL to the layers   -> harmonic (series) mean   1/(f1/E1 + f2/E2)
   * loading PARALLEL to the layers -> arithmetic (parallel) mean  f1*E1 + f2*E2
+
+The effective moduli depend only on the phase volume fractions and moduli, not
+on the number of alternating layers — so the same analytic formula applies
+regardless of --layers.
 
 The FEM modulus is measured from the reaction force on the loaded face:
 
@@ -29,6 +33,7 @@ Pass --nu to override and see the coupling error grow for the normal case.
 Usage:
     python example_layered.py
     python example_layered.py --size 48 --contrast 100
+    python example_layered.py --layers 8 --size 40
     python example_layered.py --nu 0.3        # show Poisson coupling on normal case
 """
 
@@ -44,7 +49,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 from geometry import build_node_index                              # noqa: E402
 from voxel_fem_solver_nonlinear import VoxelFEMSolverNonlinear     # noqa: E402
-from reference_solutions import make_layered_voxels, layered_reference  # noqa: E402
+from reference_solutions import layered_reference, voxel_to_E  # noqa: E402
 from report import (                                               # noqa: E402
     build_conn_dof, E_elem_from_voxels, effective_modulus_from_reaction,
     element_strain, element_stress,
@@ -53,6 +58,67 @@ from vtk_export import save_stress_strain_vtk, save_stress_strain_vti  # noqa: E
 
 E_VOID = 1e-6
 DELTA_FRAC = 1e-3        # prescribed face displacement = DELTA_FRAC * L
+
+
+# ---------------------------------------------------------------------------
+# Multi-layer voxel builder
+# ---------------------------------------------------------------------------
+
+def make_multilayer_voxels(Nx, Ny, Nz, layer_axis, E1, E2, f1, n_layers, E_max,
+                           E_void=1e-6):
+    """
+    Build a voxel array with n_layers alternating E1/E2 slabs along layer_axis.
+
+    ceil(n_layers/2) slabs are phase 1, floor(n_layers/2) are phase 2, arranged
+    as E1, E2, E1, E2, ...  Total E1 thickness ~ f1*N, total E2 ~ (1-f1)*N.
+    """
+    N = [Nx, Ny, Nz][layer_axis]
+    n1_slabs = (n_layers + 1) // 2   # number of E1 slabs (= ceil)
+    n2_slabs = n_layers // 2         # number of E2 slabs (= floor)
+
+    val1 = int(np.clip(round(E1 / E_max * 255), 1, 255))
+    val2 = int(np.clip(round(E2 / E_max * 255), 1, 255))
+
+    if n2_slabs == 0:
+        stripe = np.full(N, val1, dtype=np.uint8)
+    else:
+        n1_total = int(np.clip(round(f1 * N), n1_slabs, N - n2_slabs))
+        n2_total = N - n1_total
+
+        t1 = np.full(n1_slabs, n1_total // n1_slabs, dtype=int)
+        t1[:n1_total % n1_slabs] += 1
+
+        t2 = np.full(n2_slabs, n2_total // n2_slabs, dtype=int)
+        t2[:n2_total % n2_slabs] += 1
+
+        parts = []
+        for i in range(n_layers):
+            if i % 2 == 0:
+                parts.append(np.full(t1[i // 2], val1, dtype=np.uint8))
+            else:
+                parts.append(np.full(t2[i // 2], val2, dtype=np.uint8))
+        stripe = np.concatenate(parts)
+
+    assert len(stripe) == N, f"stripe length {len(stripe)} != N={N}"
+
+    voxels = np.empty((Nx, Ny, Nz), dtype=np.uint8)
+    if layer_axis == 0:
+        voxels[:, :, :] = stripe[:, np.newaxis, np.newaxis]
+    elif layer_axis == 1:
+        voxels[:, :, :] = stripe[np.newaxis, :, np.newaxis]
+    else:
+        voxels[:, :, :] = stripe[np.newaxis, np.newaxis, :]
+
+    f1_actual = float((stripe == val1).sum()) / N
+    info = {
+        'f1_actual': f1_actual,
+        'val1': val1,
+        'val2': val2,
+        'E1_actual': voxel_to_E(val1, E_max, E_void),
+        'E2_actual': voxel_to_E(val2, E_max, E_void),
+        'n_layers': n_layers,
+    }
+    return voxels, info
 
 
 # ---------------------------------------------------------------------------
@@ -92,10 +158,11 @@ def apply_uniaxial_bc(solver, node_idx, load_axis, delta):
 # ---------------------------------------------------------------------------
 
 def measure_effective_modulus(N, layer_axis, load_axis, E1, E2, f1, E_max, nu,
-                              max_pcg_iter, tol_pcg, verbose, vtk_path=None,
-                              vtk_format="vti", preconditioner="multigrid"):
-    voxels, info = make_layered_voxels(N, N, N, layer_axis, E1, E2, f1,
-                                       E_max, E_void=E_VOID)
+                              n_layers, max_pcg_iter, tol_pcg, verbose,
+                              vtk_path=None, vtk_format="vti",
+                              preconditioner="multigrid"):
+    voxels, info = make_multilayer_voxels(N, N, N, layer_axis, E1, E2, f1,
+                                          n_layers, E_max, E_void=E_VOID)
     L = N
     delta = DELTA_FRAC * L
 
@@ -145,6 +212,8 @@ def main():
     p = argparse.ArgumentParser(description="Layered composite effective modulus")
     p.add_argument("--size", type=int, default=40,
                    help="grid side length N (N x N x N voxels), default 40")
+    p.add_argument("--layers", type=int, default=4,
+                   help="total number of alternating E1/E2 slabs (default 4)")
     p.add_argument("--contrast", type=float, default=10.0,
                    help="stiffness contrast E2/E1, default 10")
     p.add_argument("--f1", type=float, default=0.5,
@@ -179,13 +248,18 @@ def main():
     nu_normal = 0.0 if args.nu is None else args.nu
     nu_parallel = 0.3 if args.nu is None else args.nu
 
+    n_layers = args.layers
+    if n_layers < 1:
+        p.error("--layers must be >= 1")
+
     print("=" * 66)
     print("  LAYERED COMPOSITE — EFFECTIVE MODULUS")
     print("=" * 66)
     print(f"  Grid           : {N} x {N} x {N}  ({N**3:,} voxels)")
     print(f"  Phases         : E1 = {E1:g},  E2 = {E2:g}  (contrast {E2/E1:g})")
     print(f"  Volume fraction: f1 = {f1:g}")
-    print(f"  Layers stacked along z; loading normal=z, parallel=x")
+    print(f"  Layers         : {n_layers} alternating slabs along z")
+    print(f"  Loading        : normal=z, parallel=x")
     print("=" * 66)
 
     # --- Normal to layers: harmonic (series) mean ---
@@ -196,9 +270,9 @@ def main():
     print(f"\n[1/2] NORMAL to layers (series / harmonic mean)   nu = {nu_normal:g}")
     fem_n, ref_n, info = measure_effective_modulus(
         N, layer_axis=2, load_axis=2, E1=E1, E2=E2, f1=f1, E_max=E_max,
-        nu=nu_normal, max_pcg_iter=args.max_pcg_iter, tol_pcg=args.tol_pcg,
-        verbose=args.verbose, vtk_path=vtk_normal, vtk_format=args.format,
-        preconditioner=args.preconditioner)
+        nu=nu_normal, n_layers=n_layers, max_pcg_iter=args.max_pcg_iter,
+        tol_pcg=args.tol_pcg, verbose=args.verbose, vtk_path=vtk_normal,
+        vtk_format=args.format, preconditioner=args.preconditioner)
     ana_n = ref_n['E_eff_normal']
     err_n = abs(fem_n - ana_n) / ana_n
     print(f"    actual moduli  : E1 = {info['E1_actual']:.5g},  "
@@ -211,9 +285,9 @@ def main():
     print(f"\n[2/2] PARALLEL to layers (parallel / arithmetic mean)   nu = {nu_parallel:g}")
     fem_p, ref_p, info = measure_effective_modulus(
         N, layer_axis=2, load_axis=0, E1=E1, E2=E2, f1=f1, E_max=E_max,
-        nu=nu_parallel, max_pcg_iter=args.max_pcg_iter, tol_pcg=args.tol_pcg,
-        verbose=args.verbose, vtk_path=vtk_parallel, vtk_format=args.format,
-        preconditioner=args.preconditioner)
+        nu=nu_parallel, n_layers=n_layers, max_pcg_iter=args.max_pcg_iter,
+        tol_pcg=args.tol_pcg, verbose=args.verbose, vtk_path=vtk_parallel,
+        vtk_format=args.format, preconditioner=args.preconditioner)
     ana_p = ref_p['E_eff_parallel']
     err_p = abs(fem_p - ana_p) / ana_p
     print(f"    actual moduli  : E1 = {info['E1_actual']:.5g},  "
