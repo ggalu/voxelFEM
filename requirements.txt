@@ -1,0 +1,6 @@
+numpy>=1.24
+numba>=0.57          # optional but strongly recommended for CPU acceleration
+cupy-cuda12x>=12.0   # optional for linear solver; required for nonlinear solver
+scipy>=1.10          # for zoom in multigrid prolongation
+pytest>=7.0
+pyvista>=0.44        # optional; only for binary .vti tensor export (vtk_export.save_stress_strain_vti)

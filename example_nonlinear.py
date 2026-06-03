@@ -1,0 +1,363 @@
+#!/usr/bin/env python
+"""
+Nonlinear Voxel FEM Solver — Example
+======================================
+Demonstrates VoxelFEMSolverNonlinear on an 80³ uniform block under 1%
+uniaxial tensile strain in the z-direction, comparing two material models:
+
+  1. Linear elasticity     — baseline, no stiffness change with strain
+  2. Power-law hardening   — stiffness increases with deformation
+
+Reports:
+  - NR and PCG convergence history at each load step
+  - Per-load-step timing
+  - VRAM usage (peak and breakdown)
+  - Displacement field statistics and derived quantities
+
+Usage:
+    python example_nonlinear.py
+"""
+
+import time
+import numpy as np
+import cupy as cp
+
+from geometry import build_node_index
+from constitutive import ConstitutiveModel
+from voxel_fem_solver_nonlinear import VoxelFEMSolverNonlinear
+
+
+# ---------------------------------------------------------------------------
+# VRAM helpers
+# ---------------------------------------------------------------------------
+
+def vram_used_gb():
+    """VRAM currently used (CuPy pool + untracked allocations)."""
+    pool = cp.get_default_memory_pool()
+    return pool.used_bytes() / 1e9
+
+
+def vram_free_total_gb():
+    """(free_GB, total_GB) from the CUDA device query."""
+    free, total = cp.cuda.Device(0).mem_info
+    return free / 1e9, total / 1e9
+
+
+def vram_report(label=""):
+    free, total = vram_free_total_gb()
+    used = total - free
+    tag = f"  [{label}]" if label else ""
+    print(f"  VRAM{tag}: {used:.2f} GB used / {total:.2f} GB total  "
+          f"({free:.2f} GB free)")
+
+
+# ---------------------------------------------------------------------------
+# Convergence-tracking wrapper
+# ---------------------------------------------------------------------------
+
+class TrackedSolver(VoxelFEMSolverNonlinear):
+    """
+    Thin subclass that intercepts NR progress and records it for reporting.
+    """
+
+    def _nr_step(self, u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu):
+        """Override _nr_step to collect per-iteration residuals and PCG counts."""
+        self._step_residuals = []
+        self._step_pcg_iters = []
+
+        from kernels_cupy_nl import compute_f_int_cupy, matvec_tangent_cupy
+
+        R_norm_prev = None
+        f_norm_ref = None
+
+        for k in range(self.max_nr_iter):
+            f_int = compute_f_int_cupy(
+                u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
+                self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
+                chunk_size=self.gpu_chunk_size,
+            )
+
+            R = f_target_gpu - f_int
+            R[bc_mask_gpu] = 0.0
+            R_norm = float(cp.linalg.norm(R[free_gpu]).get())
+
+            if f_norm_ref is None:
+                f_ext = float(cp.linalg.norm(f_target_gpu[free_gpu]).get())
+                f_fint = float(cp.linalg.norm(f_int[free_gpu]).get())
+                f_norm_ref = max(f_ext, f_fint, 1e-30)
+
+            rel_res = R_norm / f_norm_ref
+            self._step_residuals.append(rel_res)
+
+            if rel_res < self.tol_nr:
+                print(f"    NR iter {k:2d}  ||R||/f = {rel_res:.3e}  [converged]")
+                break
+
+            print(f"    NR iter {k:2d}  ||R||/f = {rel_res:.3e}", end="", flush=True)
+
+            eta = self._ew_tolerance(R_norm, R_norm_prev)
+            self._precond.update(u_gpu)
+
+            u_snap = u_gpu
+
+            def _mv(v, _u=u_snap):
+                return matvec_tangent_cupy(
+                    v, _u, self.E0_elem_gpu, self.B_gauss_gpu,
+                    self.w_gauss_gpu, self.nu, self.constitutive,
+                    self.Ny, self.Nz, self.Ndof,
+                    chunk_size=self.gpu_chunk_size,
+                )
+
+            pcg_count = [0]
+            original_pcg = self._pcg_gpu
+
+            def _counted_pcg(mv, b, pr, bc, **kw):
+                res = original_pcg(mv, b, pr, bc, **kw)
+                # count by proxy: iterations in PCG are hard to extract without
+                # further patching, so we track wall time instead
+                return res
+
+            t_pcg = time.perf_counter()
+            delta_u = self._pcg_gpu(
+                _mv, R, self._precond.apply, bc_mask_gpu,
+                tol=eta, max_iter=self.max_pcg_iter, verbose=False,
+            )
+            dt_pcg = time.perf_counter() - t_pcg
+            self._step_pcg_iters.append(dt_pcg)
+
+            print(f"  → PCG {dt_pcg*1000:.0f} ms")
+
+            u_gpu = u_gpu + delta_u
+            u_gpu[bc_mask_gpu] = bc_step_gpu[bc_mask_gpu]
+            R_norm_prev = R_norm
+
+        else:
+            print(f"    NR did not converge after {self.max_nr_iter} iterations")
+
+        return u_gpu
+
+
+# ---------------------------------------------------------------------------
+# Run one model
+# ---------------------------------------------------------------------------
+
+def run_model(name, constitutive, Nx, Ny, Nz, nu, E_max, E_void,
+              n_load_steps, tol_nr, max_pcg_iter, disp_frac):
+    """
+    Solve uniaxial tension problem with the given constitutive model.
+
+    Returns (u, elapsed_s, per_step_times).
+    """
+    print(f"\n{'='*70}")
+    print(f"  MODEL: {name}")
+    print(f"  {constitutive}")
+    print(f"{'='*70}")
+
+    vram_report("before init")
+
+    voxels = np.full((Nx, Ny, Nz), 200, dtype=np.uint8)   # homogeneous block
+    solver = TrackedSolver(
+        voxels,
+        nu=nu,
+        E_max=E_max,
+        E_void=E_void,
+        constitutive=constitutive,
+        n_load_steps=n_load_steps,
+        max_nr_iter=15,
+        tol_nr=tol_nr,
+        max_pcg_iter=max_pcg_iter,
+        preconditioner="jacobi",      # fast for this problem size
+        gpu_chunk_size=2_000_000,
+        verbose=False,                # TrackedSolver prints its own output
+    )
+
+    vram_report("after init")
+
+    # Boundary conditions: fix bottom face, pull top face 1%
+    node_idx = build_node_index(Nx, Ny, Nz)
+    bottom = node_idx[:, :, 0].ravel()
+    top    = node_idx[:, :, -1].ravel()
+
+    for dof in range(3):
+        solver.apply_bc_displacement(
+            bottom, np.full(len(bottom), dof, dtype=int), np.zeros(len(bottom))
+        )
+    # disp_frac is absolute displacement (domain spans [0,1] in each direction
+    # since we use unit-cube elements, so 0.01 = 1% strain)
+    solver.apply_bc_displacement(
+        top, np.full(len(top), 2, dtype=int), np.full(len(top), disp_frac)
+    )
+
+    # Solve with per-step timing
+    print(f"\n  Grid: {Nx}³ = {Nx*Ny*Nz:,} elements, {solver.Ndof:,} DOFs")
+    print(f"  Applied strain: {disp_frac*100:.1f}%  ({n_load_steps} load steps)")
+    print()
+
+    per_step_times = []
+    original_nr_step = solver._nr_step
+
+    def _timed_nr_step(u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu):
+        step_num = len(per_step_times) + 1
+        lf = step_num / n_load_steps
+        print(f"  --- Load step {step_num}/{n_load_steps}  (fraction={lf:.2f}) ---")
+        t0 = time.perf_counter()
+        u_out = original_nr_step(u_gpu, f_target_gpu, bc_mask_gpu, bc_step_gpu, free_gpu)
+        dt = time.perf_counter() - t0
+        per_step_times.append(dt)
+        print(f"  Step {step_num} wall time: {dt:.2f} s")
+        vram_report(f"step {step_num}")
+        return u_out
+
+    solver._nr_step = _timed_nr_step
+
+    t_total_start = time.perf_counter()
+    u = solver.solve()
+    elapsed = time.perf_counter() - t_total_start
+
+    cp.cuda.Device(0).synchronize()
+    vram_report("after solve")
+
+    return u, elapsed, per_step_times
+
+
+# ---------------------------------------------------------------------------
+# Results summary
+# ---------------------------------------------------------------------------
+
+def print_results(name, u, elapsed, per_step_times, Nx, Ny, Nz, disp_frac):
+    print(f"\n  {'─'*60}")
+    print(f"  RESULTS — {name}")
+    print(f"  {'─'*60}")
+
+    z_disp = u[2::3]
+    x_disp = u[0::3]
+    y_disp = u[1::3]
+
+    applied_disp = disp_frac
+    max_z = z_disp.max()
+    strain_z = max_z                           # = Δz / L, L=1 (unit domain)
+    strain_x = x_disp.std()                    # lateral contraction spread
+
+    print(f"  Displacement field:")
+    print(f"    z-disp range : [{z_disp.min():.6f},  {z_disp.max():.6f}]  "
+          f"(target max = {applied_disp:.6f})")
+    print(f"    x-disp range : [{x_disp.min():.6f},  {x_disp.max():.6f}]")
+    print(f"    y-disp range : [{y_disp.min():.6f},  {y_disp.max():.6f}]")
+    print(f"    max |u|      : {np.abs(u).max():.6f}")
+
+    print(f"\n  Timing:")
+    print(f"    Total solve time : {elapsed:.2f} s")
+    for i, dt in enumerate(per_step_times, 1):
+        print(f"    Load step {i:2d}      : {dt:.2f} s")
+
+    print(f"\n  Solver summary:")
+    n_steps = len(per_step_times)
+    print(f"    Load steps       : {n_steps}")
+    print(f"    Avg step time    : {elapsed/n_steps:.2f} s")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    # Problem parameters
+    N          = 80          # grid size
+    nu         = 0.3         # Poisson ratio
+    E_max      = 1.0         # Young's modulus at voxel=255
+    E_void     = 1e-6        # void modulus
+    disp_frac  = 0.01        # 1% tensile strain (displacement / domain length)
+    n_steps    = 5           # load steps
+    tol_nr     = 1e-5        # NR convergence tolerance (float32 precision ~1e-7)
+    max_pcg    = 200         # max PCG iterations per NR step
+
+    print("=" * 70)
+    print("  NONLINEAR VOXEL FEM — 80³ UNIAXIAL TENSION EXAMPLE")
+    print("=" * 70)
+    free, total = vram_free_total_gb()
+    print(f"  GPU: {cp.cuda.runtime.getDeviceProperties(0)['name'].decode()}")
+    print(f"  VRAM: {total:.2f} GB total,  {free:.2f} GB free at start")
+    print(f"  Grid: {N}³ = {N**3:,} elements")
+    print(f"  DOFs: {3*(N+1)**3:,}")
+    print(f"  Applied strain: {disp_frac*100:.1f}%  ({n_steps} load steps)")
+
+    results = {}
+
+    # ------------------------------------------------------------------
+    # Model 1: Linear elasticity
+    # ------------------------------------------------------------------
+    mat_linear = ConstitutiveModel(
+        "linear",
+        E_void=E_void,
+        E_max=E_max,
+    )
+    u_lin, t_lin, steps_lin = run_model(
+        "Linear elasticity",
+        mat_linear, N, N, N, nu, E_max, E_void,
+        n_steps, tol_nr, max_pcg, disp_frac,
+    )
+    results["Linear"] = (u_lin, t_lin, steps_lin)
+    print_results("Linear elasticity", u_lin, t_lin, steps_lin, N, N, N, disp_frac)
+
+    # ------------------------------------------------------------------
+    # Model 2: Power-law hardening
+    # ------------------------------------------------------------------
+    mat_hard = ConstitutiveModel(
+        "hardening",
+        E_void=E_void,
+        E_max=E_max,
+        beta=50.0,    # stiffening coefficient
+        n=0.5,        # exponent (√ε_vm hardening)
+    )
+    u_hard, t_hard, steps_hard = run_model(
+        "Power-law hardening  (β=50, n=0.5)",
+        mat_hard, N, N, N, nu, E_max, E_void,
+        n_steps, tol_nr, max_pcg, disp_frac,
+    )
+    results["Hardening"] = (u_hard, t_hard, steps_hard)
+    print_results("Power-law hardening", u_hard, t_hard, steps_hard, N, N, N, disp_frac)
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+    print(f"\n{'='*70}")
+    print("  COMPARISON")
+    print(f"{'='*70}")
+    print(f"  {'Metric':<40}  {'Linear':>12}  {'Hardening':>12}")
+    print(f"  {'─'*66}")
+    print(f"  {'Total solve time (s)':<40}  {t_lin:>12.2f}  {t_hard:>12.2f}")
+    print(f"  {'Max z-displacement':<40}  {u_lin[2::3].max():>12.6f}  {u_hard[2::3].max():>12.6f}")
+    print(f"  {'Max lateral displacement':<40}  {np.abs(u_lin[0::3]).max():>12.6f}  {np.abs(u_hard[0::3]).max():>12.6f}")
+
+    # Effective stiffness: max reaction force proxy = ||K*u|| / ||u||
+    # Approximate via ||f_int|| using a quick call
+    from kernels_cupy_nl import compute_f_int_cupy, build_B_gauss
+    B_cpu, w_cpu = build_B_gauss()
+    B_gpu = cp.asarray(B_cpu.astype(np.float32))
+    w_gpu = cp.asarray(w_cpu.astype(np.float32))
+    voxels_ref = np.full((N, N, N), 200, dtype=np.uint8)
+    E_scale = (E_max - E_void) / 255.0
+    E0_gpu = cp.asarray(voxels_ref.ravel().astype(np.float32) * E_scale + E_void)
+    Ndof = 3 * (N + 1) ** 3
+
+    eff_k = {}
+    for label, (u_arr, _, _) in results.items():
+        mat = mat_linear if label == "Linear" else mat_hard
+        u_gpu = cp.asarray(u_arr)
+        f_int = compute_f_int_cupy(u_gpu, E0_gpu, B_gpu, w_gpu, nu, mat, N, N, Ndof)
+        f_norm = float(cp.linalg.norm(f_int).get())
+        u_norm = float(cp.linalg.norm(u_gpu).get())
+        eff_k[label] = f_norm / (u_norm + 1e-30)
+        print(f"  {'Effective stiffness ||f_int||/||u||  ' + label:<40}  {eff_k[label]:>12.4f}")
+
+    ratio = eff_k["Hardening"] / (eff_k["Linear"] + 1e-30)
+    print(f"\n  Power-law hardening model is {ratio:.2f}× stiffer than linear "
+          f"at 1% strain (β=50, n=0.5 → stiffness grows as √ε_vm).")
+
+    print(f"\n{'='*70}")
+    print("  Example completed.")
+    print(f"{'='*70}\n")
+
+
+if __name__ == "__main__":
+    main()
