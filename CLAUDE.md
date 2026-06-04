@@ -258,17 +258,25 @@ voxel_fem_solver_nonlinear.py ← geometry, kernels_cupy_nl, constitutive, multi
 
 ### Float precision convention
 
-- **float16** for displacement u, update Δu, PCG direction p, preconditioned
-  residual z (controlled by `self._hp`; default `cp.float16`). These are the
-  largest arrays and dominate the VRAM budget at target scale.
-- **float32** for internal force f\_int / residual R (R reuses f\_int's buffer),
-  matvec output Ap, Jacobi / MG diagonals. These require the wider range because
-  they accumulate element contributions via `cp.add.at`.
-- **float16** for `E0_elem` (per-element base modulus, read-only after init).
+- **float32** for all large GPU arrays: u, Δu (= delta\_u from PCG), p (CG
+  direction), r (PCG residual), z (preconditioned residual), f\_int/R (shared
+  buffer), Ap (matvec output), and all Jacobi/MG diagonals.
+- **float16** for `E0_elem` (per-element base modulus, read-only after init) and
+  for multigrid `GridLevel.E_elem` on the GPU path. Both are multiplied into
+  float32 arrays during matvec and auto-promoted by CuPy's type rules.
 - **float64** only for the one-time `build_B_gauss()` / `build_K_ref()`
-  accumulation (negligible cost), then cast to float32.
+  accumulation, then cast to float32.
 - `.get()` (GPU→CPU transfer) is called only for convergence-check scalars and
   printing — never for large arrays.
+
+**Why not float16 for u?** Storing displacement in float16 (ε_rel ≈ 10⁻³)
+causes catastrophic cancellation when computing per-element strain:
+`ε_e = u[i+1] − u[i]` subtracts two nearly-equal values. In the stiff phase
+of a high-contrast composite (E₂/E₁ = C), the displacement increment per
+element is C× smaller, so the relative noise in strain is C× larger. At
+contrast 10 the effective modulus error was measured at 44%; at contrast 1000
+it reached 962%. Float32 is required for accurate stiffness extraction at any
+practically useful contrast.
 
 ### GPU memory budget (300M elements, 48 GB VRAM)
 
@@ -290,27 +298,26 @@ bytes/DOF falls with grid size because the fixed chunk overhead (~1 GB for
 | `conn_dof` (implicit — never stored) | 0.0 | |
 | `E0_elem` (float16) | 0.6 | 300 M × 2 B |
 | `B_gauss` (8 × 6×24 float32) | 0.0 | constant, tiny |
-| u, Δu (float16, 2 arrays) | 3.4 | 2 × 902 M × 2 B |
-| f\_int / R (float32, buffer reused) | 3.4 | R reuses f\_int allocation |
-| p, z (float16, 2 arrays) | 3.4 | PCG direction + precond'd residual |
-| Ap (float32) | 3.4 | matvec output |
-| MG fine-level diagonal (float32) | 3.4 | 902 M × 4 B |
+| u (float32) | 3.6 | 902 M × 4 B |
+| f\_int / R (float32, buffer reused) | 3.6 | R reuses f\_int allocation |
+| x / Δu, p, r, z (float32, PCG internals) | 14.4 | 4 × 902 M × 4 B |
+| Ap (float32) | 3.6 | matvec output |
+| MG fine-level diagonal (float32) | 3.6 | 902 M × 4 B |
 | MG coarse diagonals (geom. series) | 0.5 | sum ≈ 1/7 × fine |
 | Chunk working buffers (2 M chunk) | 1.0 | constant regardless of Ne |
 | CuPy pool cache (retained blocks) | ~1.0 | unique alloc sizes, also constant |
-| **Total** | **~20 GB** ✓ | 28 GB headroom at 48 GB |
+| **Total** | **~32 GB** ✓ | 16 GB headroom at 48 GB |
 
-The float16 optimisation for u/Δu/p/z saves ~7 GB vs the earlier all-float32
-design (which projected ~27 GB). The 300 M-voxel target fits with room to spare.
+**Capacity ceiling**: `VRAM ≈ 2 GB (fixed) + 32 B/DOF × Ndof`. For 48 GB
+available this gives a ceiling of ~480 M voxels (≈ 783³); with a 20 % safety
+margin ~385 M voxels (≈ 727³).
 
-**Capacity ceiling**: `VRAM ≈ 2 GB (fixed) + 20.6 B/DOF × Ndof`. For 48 GB
-available this gives a ceiling of ~760 M voxels (≈ 913³); with a 20 % safety
-margin, ~600 M voxels (≈ 845³).
+### VRAM reduction techniques (commits `a85425a`, `9560a16`)
 
-### VRAM reduction techniques (commit `a85425a`)
+Ten independent changes cut peak VRAM versus the initial design.
+All 47 tests remain green after each change.
 
-Six independent changes cut peak VRAM substantially versus the earlier
-all-float32 design. All 47 tests remain green after each change.
+**Batch 1 — commit `a85425a`**
 
 1. **D\_t tensor elimination** (`kernels_cupy_nl.py`).  
    Previously `build_D_cupy` was called once per Gauss point per chunk, creating
@@ -320,40 +327,69 @@ all-float32 design. All 47 tests remain green after each change.
    The `(chunk, 6, 6)` tensor is never materialised. Saves 8 × 288 MB = 2.3 GB
    peak per kernel invocation.
 
-2. **Explicit `del` after each chunk temporary** (`kernels_cupy_nl.py`).  
+2. **Explicit `del` after each chunk temporary — nonlinear kernels**
+   (`kernels_cupy_nl.py`).  
    `del` on CuPy arrays immediately drops the refcount to zero, returning the
    block to the pool before the next allocation. Applied to `dofs`, `u_local`,
    `v_local`, `eps`, `D_ref_eps`, `E_t`, `eps_vm`, `sigma`/`scaled`, `f_loc` /
    `Kv_loc`, and the intermediate connectivity arrays inside `_get_elem_dofs`.
-   This prevents peak working-set from being the sum of all temporaries.
 
 3. **Sparse BC and force storage** (`voxel_fem_solver_nonlinear.py`).  
    The two dense `(Ndof,)` float32 arrays `bc_step_gpu` and `f_target_gpu` (each
-   3.4 GB at 300 M voxels) are replaced by compact index + value arrays:
-   `bc_dofs_gpu` / `bc_vals_gpu` (one entry per constrained DOF, typically O(N²))
-   and `force_dofs_gpu` / `force_vals_gpu` (nonzero forces only; `None` for
-   displacement-controlled problems). Saves up to 2 × 3.4 = 6.8 GB.
+   3.6 GB at 300 M voxels) are replaced by compact index + value arrays.
+   Saves up to 2 × 3.6 = 7.2 GB.
 
 4. **In-place residual construction** (`voxel_fem_solver_nonlinear.py`).  
    `R = f_target - f_int` previously required both arrays live simultaneously.
-   Replaced with `cp.negative(f_int, out=f_int)` followed by a sparse scatter of
-   the external force; `R` is then an alias for the same buffer. Saves one
-   `(Ndof,)` float32 allocation (3.4 GB at 300 M voxels).
+   Replaced with `cp.negative(f_int, out=f_int)` + sparse scatter; R aliases
+   f\_int's buffer. Saves one `(Ndof,)` float32 allocation (3.6 GB at 300 M).
 
 5. **V-cycle `del r_res` before recursion** (`multigrid.py`).  
-   The fine-level residual `r_res` (= `r − K·e`, one Ndof float32 array) was
-   live throughout the coarse-level recursion and post-smooth. Adding `del r_res`
-   immediately after `_restrict` lets the pool reuse that memory on the coarse
-   side. Also removed the defensive `u.copy()` in `_smooth` (the smoother always
-   reassigns `u`, never mutates it) by adding a `copy_input` flag defaulting to
-   `False` on the two calls inside `vcycle`.
+   The fine-level residual was live throughout coarse recursion and post-smooth.
+   `del r_res` immediately after `_restrict` lets the pool reuse that memory.
+   `copy_input=False` on smoother calls removes the defensive `u.copy()`.
 
 6. **Free old MG hierarchy before rebuild** (`multigrid_nl.py`).  
-   `NonlinearMultigrid.update()` now executes `del self._gmg` followed by
-   `cp.get_default_memory_pool().free_all_blocks()` before constructing the new
-   `GeometricMultigrid`. This ensures the old hierarchy's GPU memory (diagonals
-   at all levels, O(Ndof) float32) is released to the OS before the new one is
-   allocated, preventing the old and new hierarchies from coexisting.
+   `del self._gmg; cp.get_default_memory_pool().free_all_blocks()` before
+   rebuilding ensures the old hierarchy's GPU memory is released to the OS before
+   the new one is allocated. Prevents old and new hierarchies from coexisting.
+
+**Batch 2 — commit `9560a16`**
+
+7. **PCG simplification: `p` always float32, `r_free` eliminated**
+   (`voxel_fem_solver_nonlinear.py`).  
+   The CG direction `p` is now always float32 (`p = z`, no `astype`). This was
+   motivated by discovering that half-precision `p` caused float16 overflow for
+   poorly-conditioned problems. As a by-product, the residual norm is now computed
+   as `cp.dot(r, r)` directly (r is already zeroed at BC DOFs each iteration),
+   eliminating the `r_free = r[free_gpu]` sub-vector copy (~3.6 GB transient at
+   300 M voxels per convergence check). `copy=False` on the x update avoids two
+   redundant Ndof allocations per PCG iteration when storage is float32.
+
+8. **MG `E_elem` → float16** (`multigrid.py`).  
+   `GridLevel` stores `E_elem` as float16 on the GPU path. CuPy auto-promotes
+   float16 × float32 → float32 in `matvec_Ku_cupy` and `build_diagonal_cupy`.
+   Saves ~0.6 GB at the fine level for 300 M voxels (was float32, duplicating
+   `E0_elem_gpu` which is already float16 in the solver).
+
+9. **Explicit `del` in MG kernels** (`kernels_cupy_nl.py`).  
+   `matvec_Ku_cupy` and `build_diagonal_cupy` now delete `elem_ids`, `dofs`,
+   `u_loc`, `Ku_loc`, and `contrib` at the end of each chunk, matching the
+   nonlinear kernels. Reduces pool fragmentation during hierarchy builds.
+
+10. **Precompute `omega_diag_inv`** (`multigrid.py`).  
+    `GridLevel` stores `omega_diag_inv = 0.67 × diag_inv` at construction and
+    after `set_bc()`. The smoother uses `level.omega_diag_inv` directly,
+    eliminating one `(Ndof,)` float32 multiply per smooth iteration.
+
+**Why float16 for u was not pursued**: storing displacement in float16
+(ε_rel ≈ 10⁻³) causes catastrophic cancellation in per-element strain
+computation (ε = u[i+1] − u[i]). In the stiff phase of a high-contrast
+composite the displacement increment per element is C× smaller than the base
+displacement, so float16 noise in u grows C× larger relative to the true
+strain. Measured at contrast 10: 44% error in effective modulus; contrast 1000:
+962% error. Float32 is required for any physically meaningful stiffness
+extraction. See "Float precision convention" above.
 
 ### Test layout
 
@@ -469,7 +505,7 @@ Two invariants the writers enforce:
 - **CuPy only** for all hot-path computation. No NumPy in any kernel. `np` is
   for one-time setup (B_gauss precomputation, host arrays) only.
 - **Implicit connectivity everywhere** in the GPU path — no `conn_dof` array.
-- **float16** for u, Δu, p, z (dominant VRAM consumers); **float32** for f\_int/R, Ap, diagonals (need wide range for scatter-accumulate); **float64** only for one-time setup accumulation.
+- **float32** for all large GPU arrays (u, PCG vectors, diagonals); **float16** for E0\_elem and MG E\_elem only; **float64** only for one-time setup accumulation.
 - **No sparse matrix assembly** — matrix-free end-to-end.
 - **Graceful GPU check**: kernels/constitutive raise a clear `RuntimeError` at
   import if CuPy is unavailable.
