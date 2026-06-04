@@ -297,7 +297,7 @@ all float32 — commits `a85425a` + `9560a16` + `60449df`):
 bytes/DOF falls with grid size because the fixed chunk overhead (~800 MB for
 `chunk_size=2 M`) dominates at small grids. At target scale it is negligible.
 
-**Projected budget at 300 M voxels (N≈669, Ndof≈902 M)**:
+**Projected budget at 300 M voxels (N≈669, Ndof≈902 M)** — commit `13e049e`:
 
 | Item | GB | Notes |
 |---|---|---|
@@ -305,14 +305,14 @@ bytes/DOF falls with grid size because the fixed chunk overhead (~800 MB for
 | `E0_elem` (float16) | 0.6 | 300 M × 2 B |
 | `B_gauss` (8 × 6×24 float32) | 0.0 | constant, tiny |
 | u (float32) | 3.6 | 902 M × 4 B |
-| f\_int / R (float32, buffer reused) | 3.6 | R reuses f\_int allocation |
-| x / Δu, p, r, z (float32, PCG internals) | 14.4 | 4 × 902 M × 4 B |
-| Ap (float32) | 3.6 | matvec output |
-| MG fine-level diagonal (float32) | 3.6 | 902 M × 4 B |
+| f\_int / R / r (float32, one buffer) | 3.6 | R aliases f\_int; r aliases R in PCG |
+| x / Δu, p (=z), Ap (float32, PCG) | 10.8 | 3 × 902 M × 4 B |
+| MG fine-level diagonal (float32) | 3.6 | 902 M × 4 B (`omega_diag_inv` removed) |
 | MG coarse diagonals (geom. series) | 0.5 | sum ≈ 1/7 × fine |
+| `bc_dofs_gpu` / `GridLevel.bc_mask` (int32) | 0.0 | O(N^{2/3}) face DOFs, ~tens MB |
 | Chunk working buffers (2 M chunk) | 1.0 | constant regardless of Ne |
 | CuPy pool cache (retained blocks) | ~1.0 | unique alloc sizes, also constant |
-| **Total** | **~32 GB** ✓ | 16 GB headroom at 48 GB |
+| **Total** | **~25 GB** ✓ | 23 GB headroom at 48 GB |
 
 **Capacity ceiling**: linear fit to the three measurements gives
 `VRAM ≈ 827 MB (fixed) + 251 MB/M_vox × Ne`. At 48 GB available:
@@ -322,9 +322,9 @@ ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
 > **Extrapolation caveat**: the fit is dominated by the fixed chunk
 > overhead (~800 MB, constant for `chunk_size=2 M`) which inflates the
 > apparent per-voxel slope. At 300 M voxels the chunk term is <1% of
-> total; the true asymptotic cost per DOF converges to ~32 B/DOF (6
-> float32 PCG vectors + diagonal + E0 + MG coarse), giving ~32 GB for
-> 300 M voxels — comfortably within the 48 GB budget.
+> total; the true asymptotic cost per DOF converges to ~25 B/DOF
+> (see budget table above), giving ~25 GB for 300 M voxels —
+> comfortably within the 48 GB budget with 23 GB headroom.
 
 ### VRAM reduction techniques (commits `a85425a`, `9560a16`, `60449df`)
 
@@ -395,6 +395,8 @@ All 47 tests remain green after each change.
     `GridLevel` stores `omega_diag_inv = 0.67 × diag_inv` at construction and
     after `set_bc()`. The smoother uses `level.omega_diag_inv` directly,
     eliminating one `(Ndof,)` float32 multiply per smooth iteration.
+    *This was subsequently reversed in Batch 4 (see below) — `omega_diag_inv`
+    is now removed entirely; the smoother uses fully in-place ops instead.*
 
 **Batch 3 — commit `60449df`**
 
@@ -422,6 +424,55 @@ All 47 tests remain green after each change.
     PCG loop, no `u_f32` upcast boilerplate in `_nr_step`/`_linear_step`, and no
     BC-correction step on output. `_pcg_gpu` lost its `storage_dtype` parameter;
     x is always float32 and `x += alpha * p` works directly.
+
+**Batch 4 — commit `13e049e`**
+
+Six structural changes cutting ~10 GB at 300 M voxels (from the true ~35 GB
+untracked peak to ~25 GB). All 47 tests remain green.
+
+12. **Remove `omega_diag_inv`; in-place smoother** (`multigrid.py`).  
+    `GridLevel` was storing a full duplicate Ndof float32 array
+    `omega_diag_inv = 0.67 × diag_inv` (item #10 above). That array is now
+    gone. The Jacobi smoother is rewritten to work in-place on the matvec
+    output:
+    ```
+    delta = level.matvec(u)     # one Ndof alloc (unavoidable)
+    delta -= f                   # in-place
+    delta *= level.diag_inv      # in-place
+    delta *= 0.67                # in-place scalar
+    u -= delta                   # in-place
+    ```
+    Previously `u = u + omega_diag_inv * r` allocated three Ndof temporaries
+    per smooth step (matvec output, `r = f − Ku`, `omega_diag_inv * r`, new u).
+    Now only one temporary exists at peak (delta). Combined fine + coarse:
+    **~4.1 GB persistent, ~7 GB transient peak reduction**.
+
+13. **`GridLevel.bc_mask` stored as int32 indices** (`multigrid.py`).  
+    `set_bc()` now calls `np.where(bc_mask)[0].astype(np.int32)` and stores
+    the compact index array on `xp`. BCs are face DOFs — O(N²ᐟ³) ≈ tens of MB
+    as int32, vs ~0.9 GB as a full-Ndof bool at the fine level. All downstream
+    fancy-indexing assignments (`w[bc_idx] = u[bc_idx]`, `r[bc_idx] = 0`)
+    work identically with int32. **~1.0 GB saved** across fine + coarse levels.
+
+14. **Eliminate `bc_mask_gpu` full-Ndof bool** (`voxel_fem_solver_nonlinear.py`).  
+    The solver no longer creates `bc_mask_gpu = cp.asarray(self.bc_mask)`.
+    All BC scatter/zero operations now use the sparse `bc_dofs_gpu` (int32)
+    already built for the BC value updates. **~0.9 GB saved**.
+
+15. **Eliminate `free_gpu` full-Ndof bool** (`voxel_fem_solver_nonlinear.py`).  
+    `free_gpu = ~bc_mask_gpu` was used only for norm computations
+    (`norm(f_int[free_gpu])`). Replaced by zeroing the BC DOFs of `f_int` in-
+    place (`f_int[bc_dofs_gpu] = 0.0`) and then taking `norm(f_int)`. This is
+    numerically identical since the BC entries become zero before the norm.
+    **~0.9 GB saved**.
+
+16. **Alias `r = b_gpu` in PCG — no copy** (`voxel_fem_solver_nonlinear.py`).  
+    `_pcg_gpu` previously started with `r = b_gpu.copy()` (3.6 GB). The copy
+    was defensive, but `b_gpu` (= R) already has BC DOFs zeroed by the caller,
+    and `b_gpu` is `del`-ed immediately after PCG returns. Aliasing `r = b_gpu`
+    makes f\_int / R / r *one buffer* throughout the solve, not two.
+    `r0 = dot(r,r)` is computed before the loop modifies `r` in-place.
+    **~3.6 GB saved**.
 
 ### Test layout
 
