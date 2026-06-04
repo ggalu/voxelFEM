@@ -82,7 +82,6 @@ class GridLevel:
 
         diag = xp.where(diag < 1e-12, xp.asarray(1.0, dtype=diag.dtype), diag)
         self.diag_inv = (1.0 / diag).astype(np.float32)
-        self.omega_diag_inv = (0.67 * self.diag_inv)  # precomputed for smoother
 
         # Essential (Dirichlet) DOFs for this level; set via set_bc(). Without
         # BCs the operator is singular (rigid-body modes) and the V-cycle
@@ -95,16 +94,17 @@ class GridLevel:
 
         Constrained DOFs become identity rows in ``matvec`` and are frozen by
         the smoother (``diag_inv = 1`` there), so a homogeneous correction keeps
-        them at zero throughout the V-cycle. ``bc_mask`` comes in as a NumPy
-        bool array (masks are derived on the CPU) and is moved to ``xp``.
+        them at zero throughout the V-cycle. ``bc_mask`` arrives as a NumPy
+        bool array; it is converted to int32 indices and stored on ``xp`` to
+        avoid holding a full-Ndof bool per level.
         """
         if bc_mask is None:
             self.bc_mask = None
             return
-        self.bc_mask = self.xp.asarray(bc_mask)
+        bc_idx = np.where(bc_mask)[0].astype(np.int32)
+        self.bc_mask = self.xp.asarray(bc_idx)
         self.diag_inv = self.diag_inv.copy()
         self.diag_inv[self.bc_mask] = 1.0
-        self.omega_diag_inv = 0.67 * self.diag_inv
 
     def matvec(self, u):
         """Apply K·u for this level (identity rows on constrained DOFs)."""
@@ -324,13 +324,19 @@ class GeometricMultigrid:
                 n_iter: int, copy_input: bool = True) -> np.ndarray:
         """
         Damped Jacobi smoother: u ← u + ω · D⁻¹ · (f − K·u)
+
+        Uses in-place ops to keep transient allocation to one Ndof array
+        (the matvec output), rather than the ~4× Ndof of the naive version.
         """
         if copy_input:
             u = u.copy()
 
         for _ in range(n_iter):
-            r = f - level.matvec(u)
-            u = u + level.omega_diag_inv * r
+            delta = level.matvec(u)  # allocs one Ndof array (unavoidable)
+            delta -= f               # delta = K·u − f
+            delta *= level.diag_inv  # in-place: diag_inv·(K·u − f)
+            delta *= 0.67            # in-place scalar
+            u -= delta               # u += 0.67·diag_inv·(f − K·u)
 
         return u
 

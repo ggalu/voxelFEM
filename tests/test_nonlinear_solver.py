@@ -170,8 +170,8 @@ def test_nr_quadratic_convergence():
     residuals = []
     original_nr_step = solver._nr_step
 
-    def _patched_nr_step(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
-                         force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
+    def _patched_nr_step(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
+                         force_dofs_gpu, force_vals_gpu, _has_forces):
         import cupy as cp
         from kernels_cupy_nl import compute_f_int_cupy
         R_norm_prev = None
@@ -185,20 +185,22 @@ def test_nr_quadratic_convergence():
                 solver.Ny, solver.Nz, solver.Ndof,
                 chunk_size=solver.gpu_chunk_size,
             )
+            # Zero BC DOFs so norm(f_int) == norm over free DOFs
+            f_int[bc_dofs_gpu] = 0.0
             if f_norm_ref is None:
-                f_norm_int = float(cp.linalg.norm(f_int[free_gpu]).get())
+                f_norm_int = float(cp.linalg.norm(f_int).get())
                 f_norm_ext = (lf * float(cp.linalg.norm(force_vals_gpu).get())
                               if _has_forces else 0.0)
                 f_norm_ref = max(f_norm_ext, f_norm_int, 1e-30)
 
-            # Build R = f_ext - f_int in-place
+            # Build R = f_ext - f_int in-place (BC DOFs already 0)
             cp.negative(f_int, out=f_int)
             if _has_forces:
                 cp.add.at(f_int, force_dofs_gpu, lf * force_vals_gpu)
-            f_int[bc_mask_gpu] = 0.0
+            f_int[bc_dofs_gpu] = 0.0  # re-zero after force scatter
             R = f_int
 
-            R_norm = float(cp.linalg.norm(R[free_gpu]).get())
+            R_norm = float(cp.linalg.norm(R).get())  # R already 0 at BC DOFs
             residuals.append(R_norm)
 
             if R_norm / f_norm_ref < solver.tol_nr:
@@ -216,7 +218,7 @@ def test_nr_quadratic_convergence():
                                            solver.Ny, solver.Nz, solver.Ndof,
                                            chunk_size=solver.gpu_chunk_size)
 
-            delta_u = solver._pcg_gpu(_mv, R, solver._precond.apply, bc_mask_gpu,
+            delta_u = solver._pcg_gpu(_mv, R, solver._precond.apply, bc_dofs_gpu,
                                        tol=eta, max_iter=solver.max_pcg_iter, verbose=False)
             u_gpu_local = u_gpu_local + delta_u
             u_gpu_local[bc_dofs_gpu] = (lf * bc_vals_gpu)
@@ -352,17 +354,22 @@ def test_softening_decreasing_stiffness():
     stiffnesses = []
     original_nr_step = solver._nr_step
 
-    def _patched(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
-                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
-        u_out = original_nr_step(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
-                                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu)
+    def _patched(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
+                 force_dofs_gpu, force_vals_gpu, _has_forces):
+        u_out = original_nr_step(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
+                                 force_dofs_gpu, force_vals_gpu, _has_forces)
         f_int = compute_f_int_cupy(
             u_out, solver.E0_elem_gpu, solver.B_gauss_gpu, solver.w_gauss_gpu,
             solver.nu, solver.constitutive, solver.Ny, solver.Nz, solver.Ndof,
             chunk_size=solver.gpu_chunk_size
         )
-        u_norm = float(cp.linalg.norm(u_out[~bc_mask_gpu]).get())
-        f_norm = float(cp.linalg.norm(f_int[~bc_mask_gpu]).get())
+        # Norm over free DOFs: zero BC indices in temporaries
+        u_tmp = u_out.copy()
+        u_tmp[bc_dofs_gpu] = 0.0
+        u_norm = float(cp.linalg.norm(u_tmp).get())
+        del u_tmp
+        f_int[bc_dofs_gpu] = 0.0   # f_int is fresh, OK to zero in-place
+        f_norm = float(cp.linalg.norm(f_int).get())
         stiffnesses.append(f_norm / (u_norm + 1e-30))
         return u_out
 
@@ -415,17 +422,22 @@ def test_hardening_increasing_stiffness():
     stiffnesses = []
     original_nr_step = solver._nr_step
 
-    def _patched(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
-                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
-        u_out = original_nr_step(u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
-                                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu)
+    def _patched(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
+                 force_dofs_gpu, force_vals_gpu, _has_forces):
+        u_out = original_nr_step(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
+                                 force_dofs_gpu, force_vals_gpu, _has_forces)
         f_int = compute_f_int_cupy(
             u_out, solver.E0_elem_gpu, solver.B_gauss_gpu, solver.w_gauss_gpu,
             solver.nu, solver.constitutive, solver.Ny, solver.Nz, solver.Ndof,
             chunk_size=solver.gpu_chunk_size
         )
-        u_norm = float(cp.linalg.norm(u_out[~bc_mask_gpu]).get())
-        f_norm = float(cp.linalg.norm(f_int[~bc_mask_gpu]).get())
+        # Norm over free DOFs: zero BC indices in temporaries
+        u_tmp = u_out.copy()
+        u_tmp[bc_dofs_gpu] = 0.0
+        u_norm = float(cp.linalg.norm(u_tmp).get())
+        del u_tmp
+        f_int[bc_dofs_gpu] = 0.0   # f_int is fresh, OK to zero in-place
+        f_norm = float(cp.linalg.norm(f_int).get())
         stiffnesses.append(f_norm / (u_norm + 1e-30))
         return u_out
 
