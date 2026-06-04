@@ -26,12 +26,15 @@ Constitutive models (via ConstitutiveModel):
   hardening : E_t = E0 · (1 + beta · eps_vm^n)
 
 GPU memory (300M elements, 48 GB VRAM):
-  E0_elem (float16, always): 0.56 GB
-  u, Δu (bfloat16 when half_precision=True): 3.4 GB
-  f_int, R, p, z (float32 always): 13.6 GB
-  Tangent matvec working buffers: ~4 GB
-  Multigrid coarse levels: ~1.5 GB
-  Total (half_precision=True): ~23 GB ✓
+  E0_elem (float16, always):          0.6 GB
+  u, Δu, p — float16 (half_prec):    5.4 GB   (3 arrays × 1.8 GB)
+  f_int/R, Ap — float32:             7.2 GB   (2 arrays × 3.6 GB)
+  r, z — float32 (PCG residual):     7.2 GB   (2 arrays × 3.6 GB)
+  MG fine diagonal — float32:        3.6 GB
+  MG coarse diagonals:               0.5 GB
+  Chunk working buffers (2M chunk):  ~1.0 GB
+  CuPy pool cache:                   ~1.0 GB
+  Total (half_precision=True):      ~26.5 GB ✓ (28 GB headroom at 48 GB)
 
 Example
 -------
@@ -161,10 +164,12 @@ class VoxelFEMSolverNonlinear:
     max_pcg_iter : int — max PCG iterations per NR step (default 200)
     preconditioner : str — "multigrid" or "jacobi" (default "multigrid")
     gpu_chunk_size : int — elements per GPU chunk (default 2_000_000)
-    half_precision : bool — store u, delta_u, p (PCG direction) as bfloat16 to
-        halve their VRAM footprint; E0_elem is always stored as float16.
-        All arithmetic is still performed in float32; the reduced-precision
-        vectors are upcast before every matvec and dot product.  Default False.
+    half_precision : bool — store u and Δu as float16 to reduce VRAM
+        (E0_elem is always float16 regardless). All arithmetic is float32;
+        p, r, z stay float32 to ensure PCG converges to tight tolerances.
+        Caution: float16 u has ~0.1% precision; reaction-force quantities
+        (e.g. effective modulus) are amplified by contrast and may lose
+        accuracy. Default False (float32 everywhere).
     verbose : bool — print NR/PCG progress (default True)
     """
 
@@ -204,7 +209,7 @@ class VoxelFEMSolverNonlinear:
         self.preconditioner = preconditioner
         self.gpu_chunk_size = gpu_chunk_size
         self.half_precision = half_precision
-        self._hp = cp.bfloat16 if half_precision else cp.float32
+        self._hp = cp.float16 if half_precision else cp.float32
         self.verbose = verbose
         self.pcg_print_interval = 10
         self._kappa_probe = 20
@@ -345,7 +350,12 @@ class VoxelFEMSolverNonlinear:
                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu,
             )
 
-        return cp.asnumpy(u_gpu.astype(cp.float32))
+        u_out = cp.asnumpy(u_gpu.astype(cp.float32))
+        # Restore exact float32 BC values: half-precision storage rounds them,
+        # but the caller expects the prescribed values to be exact.
+        if self._hp != cp.float32:
+            u_out[np.where(self.bc_mask)[0]] = self.bc_values[self.bc_mask]
+        return u_out
 
     def _nr_step(self, u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
                  force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
@@ -414,7 +424,7 @@ class VoxelFEMSolverNonlinear:
 
             # Inner PCG solve: K_t(u) · Δu = R
             delta_u = self._pcg_gpu(
-                _matvec, R, _apply_precond, bc_mask_gpu, free_gpu,
+                _matvec, R, _apply_precond, bc_mask_gpu,
                 tol=eta, max_iter=self.max_pcg_iter,
                 verbose=self.verbose, storage_dtype=self._hp,
             )
@@ -487,7 +497,7 @@ class VoxelFEMSolverNonlinear:
             )
 
         delta_u = self._pcg_gpu(
-            _matvec, R, self._precond.apply, bc_mask_gpu, free_gpu,
+            _matvec, R, self._precond.apply, bc_mask_gpu,
             tol=self.tol_pcg, max_iter=self.max_pcg_iter,
             verbose=self.verbose, storage_dtype=self._hp,
         )
@@ -512,25 +522,30 @@ class VoxelFEMSolverNonlinear:
         eta = min(0.5, R_norm / (R_norm_prev + 1e-30))
         return max(eta, self.tol_nr / 10.0)
 
-    def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu, free_gpu,
+    def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu,
                  tol=1e-6, max_iter=200, verbose=False,
                  storage_dtype=cp.float32):
         """
         Preconditioned Conjugate Gradient with GPU-resident vectors.
 
         r and Ap stay float32 for convergence accuracy.  x and p are stored in
-        storage_dtype (float32 or bfloat16); they are upcast before every matvec
+        storage_dtype (float32 or float16); they are upcast before every matvec
         and dot product so arithmetic precision is unaffected.
+
+        r is explicitly zeroed at constrained DOFs after every update, so
+        cp.dot(r, r) gives ||r_free||² without extracting a sub-vector.
 
         Parameters
         ----------
         matvec : callable (Ndof,)→(Ndof,) on GPU — applies K_tangent
-        b_gpu  : (Ndof,) float32 CuPy — right-hand side
+        b_gpu  : (Ndof,) float32 CuPy — right-hand side (zeroed at BC DOFs)
         precond : callable (Ndof,)→(Ndof,) — preconditioner M^{-1}
         bc_mask_gpu : (Ndof,) bool CuPy — constrained DOFs
-        free_gpu : (Ndof,) bool CuPy — ~bc_mask_gpu, passed in to avoid recompute
         storage_dtype : cp dtype — storage dtype for x and p (default float32)
         """
+        # x accumulates the solution in storage_dtype (float16 when half_precision).
+        # p, r, z stay float32 throughout — p in float16 overflows for
+        # poorly-conditioned problems and prevents convergence to tight tolerances.
         x = cp.zeros(b_gpu.shape[0], dtype=storage_dtype)
 
         def _Kfree(v):
@@ -552,9 +567,10 @@ class VoxelFEMSolverNonlinear:
         r[bc_mask_gpu] = 0.0
 
         z = _Mfree(r)          # float32
-        p = z.astype(storage_dtype)
+        p = z                  # p is always float32 (z already is)
         rz = float(cp.dot(r, z).get())
-        r0 = float(cp.dot(b_gpu[free_gpu], b_gpu[free_gpu]).get()) + 1e-30
+        # b_gpu is zeroed at BC DOFs before this call, so dot(b,b) = ||b_free||²
+        r0 = float(cp.dot(b_gpu, b_gpu).get()) + 1e-30
 
         alphas:      list = []
         betas:       list = []
@@ -566,17 +582,16 @@ class VoxelFEMSolverNonlinear:
 
         res = 1.0
         for it in range(max_iter):
-            p_f32 = p.astype(cp.float32)
-            Ap = _Kfree(p_f32)                          # float32
-            pAp = float(cp.dot(p_f32, Ap).get())
+            # p is always float32 — no upcast needed
+            Ap = _Kfree(p)                              # float32
+            pAp = float(cp.dot(p, Ap).get())
             alpha = rz / (pAp + 1e-30)
             alphas.append(alpha)
 
-            # Update x in-place to avoid a large intermediate allocation
-            x_f32 = x.astype(cp.float32)
-            x_f32 += alpha * p_f32
-            x = x_f32.astype(storage_dtype)
-            del x_f32
+            # Update x: copy=False avoids redundant allocation when dtype matches
+            x_f32 = x.astype(cp.float32, copy=False)
+            x_f32 += alpha * p
+            x = x_f32.astype(storage_dtype, copy=False)
 
             r -= alpha * Ap                              # float32 in-place
             del Ap
@@ -585,9 +600,8 @@ class VoxelFEMSolverNonlinear:
             z = _Mfree(r)                               # float32
             rz_new = float(cp.dot(r, z).get())
 
-            r_free = r[free_gpu]
-            res = float(cp.sqrt(cp.dot(r_free, r_free) / r0).get())
-            del r_free
+            # r is zeroed at BC DOFs → dot(r,r) = ||r_free||² without sub-vector
+            res = float(cp.sqrt(cp.dot(r, r) / r0).get())
             res_history.append(res)
 
             # Condition number estimate after kappa_probe iterations
@@ -615,15 +629,14 @@ class VoxelFEMSolverNonlinear:
 
             if res < tol:
                 print(f"    PCG converged at iter {it},  residual = {res:.3e}")
-                del p_f32, z
+                del z
                 break
 
             beta = rz_new / (rz + 1e-30)
             betas.append(beta)
-            # Update p in-place on z to avoid a large intermediate
-            z += beta * p_f32
-            p = z.astype(storage_dtype)
-            del p_f32, z
+            # p stays float32: accumulate in z's buffer (no copy needed)
+            z += beta * p
+            p = z
             rz = rz_new
         else:
             print(f"    ⚠ PCG did NOT converge: {max_iter} iters, "

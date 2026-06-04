@@ -69,8 +69,10 @@ class GridLevel:
                                   self.K_ref, self.Ndof)
         else:
             # ----- GPU path: implicit connectivity, no conn_dof stored -----
+            # E_elem stored as float16 (halves the 1.2 GB fine-level footprint
+            # at 300M voxels; matvec ops upcast to float32 automatically).
             from kernels_cupy_nl import build_diagonal_cupy
-            self.E_elem = xp.asarray(E_elem_cpu)
+            self.E_elem = xp.asarray(E_elem_cpu, dtype=xp.float16)
             self.K_ref = xp.asarray(K_ref_cpu.astype(np.float32))
             self.conn_dof = None
             diag_ref = xp.asarray(np.diag(K_ref_cpu).astype(np.float32))
@@ -80,6 +82,7 @@ class GridLevel:
 
         diag = xp.where(diag < 1e-12, xp.asarray(1.0, dtype=diag.dtype), diag)
         self.diag_inv = (1.0 / diag).astype(np.float32)
+        self.omega_diag_inv = (0.67 * self.diag_inv)  # precomputed for smoother
 
         # Essential (Dirichlet) DOFs for this level; set via set_bc(). Without
         # BCs the operator is singular (rigid-body modes) and the V-cycle
@@ -101,6 +104,7 @@ class GridLevel:
         self.bc_mask = self.xp.asarray(bc_mask)
         self.diag_inv = self.diag_inv.copy()
         self.diag_inv[self.bc_mask] = 1.0
+        self.omega_diag_inv = 0.67 * self.diag_inv
 
     def matvec(self, u):
         """Apply K·u for this level (identity rows on constrained DOFs)."""
@@ -321,13 +325,12 @@ class GeometricMultigrid:
         """
         Damped Jacobi smoother: u ← u + ω · D⁻¹ · (f − K·u)
         """
-        omega = 0.67
         if copy_input:
             u = u.copy()
 
         for _ in range(n_iter):
             r = f - level.matvec(u)
-            u = u + omega * level.diag_inv * r
+            u = u + level.omega_diag_inv * r
 
         return u
 

@@ -374,13 +374,16 @@ def matvec_Ku_cupy(u_gpu, E_elem_gpu, K_ref_gpu, Ny, Nz, Ndof,
 
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)            # (chunk, 24)
+        del elem_ids
         u_loc = u_gpu[dofs]                                # (chunk, 24)
 
         # K_ref · u_loc per element, then scale by E_elem
         Ku_loc = cp.einsum('ij,cj->ci', K_ref_gpu, u_loc)  # (chunk, 24)
+        del u_loc
         Ku_loc *= E_elem_gpu[start:end, None]
 
         cp.add.at(f, dofs.ravel(), Ku_loc.ravel())
+        del dofs, Ku_loc
 
     return f
 
@@ -412,8 +415,10 @@ def build_diagonal_cupy(E_elem_gpu, diag_ref_gpu, Ny, Nz, Ndof,
 
         elem_ids = cp.arange(start, end, dtype=cp.int32)
         dofs = _get_elem_dofs(elem_ids, Ny, Nz)               # (chunk, 24)
+        del elem_ids
         contrib = E_elem_gpu[start:end, None] * diag_ref_gpu[None, :]
         cp.add.at(diag, dofs.ravel(), contrib.ravel())
+        del dofs, contrib
 
     return diag
 

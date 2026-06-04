@@ -216,7 +216,7 @@ def test_nr_quadratic_convergence():
                                            solver.Ny, solver.Nz, solver.Ndof,
                                            chunk_size=solver.gpu_chunk_size)
 
-            delta_u = solver._pcg_gpu(_mv, R, solver._precond.apply, bc_mask_gpu, free_gpu,
+            delta_u = solver._pcg_gpu(_mv, R, solver._precond.apply, bc_mask_gpu,
                                        tol=eta, max_iter=solver.max_pcg_iter, verbose=False)
             u_gpu_local = u_gpu_local + delta_u
             u_gpu_local[bc_dofs_gpu] = (lf * bc_vals_gpu)
