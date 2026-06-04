@@ -314,7 +314,12 @@ bytes/DOF falls with grid size because the fixed chunk overhead (~800 MB for
 | CuPy pool cache (retained blocks) | ~1.0 | unique alloc sizes, also constant |
 | **Total** | **~25 GB** ✓ | 23 GB headroom at 48 GB |
 
-**Capacity ceiling**: linear fit to the three measurements gives
+**Empirically measured capacity (2026-06-04, commit `d6c57b0`)**: on a clean
+48 GB GPU the solver runs successfully up to **~250 M voxels** and fails with
+OOM beyond that. The 300 M voxel target therefore **exceeds the current
+hardware capacity** by ~20%.
+
+**Capacity ceiling**: linear fit to the three small-scale measurements gives
 `VRAM ≈ 827 MB (fixed) + 251 MB/M_vox × Ne`. At 48 GB available:
 ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
 (note: small-scale fit over-estimates at target scale — see note below).
@@ -323,8 +328,10 @@ ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
 > overhead (~800 MB, constant for `chunk_size=2 M`) which inflates the
 > apparent per-voxel slope. At 300 M voxels the chunk term is <1% of
 > total; the true asymptotic cost per DOF converges to ~25 B/DOF
-> (see budget table above), giving ~25 GB for 300 M voxels —
-> comfortably within the 48 GB budget with 23 GB headroom.
+> (see budget table above). The ~25 GB analytic projection is optimistic
+> relative to the empirically measured ~250 M voxel OOM ceiling; the gap
+> is likely due to CuPy pool fragmentation and V-cycle transient
+> allocations not captured in the steady-state table.
 
 ### VRAM reduction techniques (commits `a85425a`, `9560a16`, `60449df`)
 
