@@ -50,6 +50,11 @@ python example_nonlinear.py
 # Layered composite: FEM vs analytic effective modulus; writes per-voxel VTK
 python example_layered.py                       # 40³, contrast 10, writes .vti
 python example_layered.py --size 48 --contrast 100 --format vtk
+
+# Peak VRAM benchmark (runs 100³, 150³, 200³ by default; clean GPU required)
+python measure_vram.py                          # all three benchmark sizes
+python measure_vram.py 200                      # single size
+python measure_vram.py 100 200 --preconditioner jacobi
 ```
 
 **After every change to a `.py` file, run the test suite before proceeding.**
@@ -321,7 +326,7 @@ ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
 > float32 PCG vectors + diagonal + E0 + MG coarse), giving ~32 GB for
 > 300 M voxels — comfortably within the 48 GB budget.
 
-### VRAM reduction techniques (commits `a85425a`, `9560a16`)
+### VRAM reduction techniques (commits `a85425a`, `9560a16`, `60449df`)
 
 Ten independent changes cut peak VRAM versus the initial design.
 All 47 tests remain green after each change.
@@ -391,14 +396,32 @@ All 47 tests remain green after each change.
     after `set_bc()`. The smoother uses `level.omega_diag_inv` directly,
     eliminating one `(Ndof,)` float32 multiply per smooth iteration.
 
-**Why float16 for u was not pursued**: storing displacement in float16
-(ε_rel ≈ 10⁻³) causes catastrophic cancellation in per-element strain
-computation (ε = u[i+1] − u[i]). In the stiff phase of a high-contrast
-composite the displacement increment per element is C× smaller than the base
-displacement, so float16 noise in u grows C× larger relative to the true
-strain. Measured at contrast 10: 44% error in effective modulus; contrast 1000:
-962% error. Float32 is required for any physically meaningful stiffness
-extraction. See "Float precision convention" above.
+**Batch 3 — commit `60449df`**
+
+11. **Remove `half_precision` switch; solver simplified to float32 throughout**
+    (`voxel_fem_solver_nonlinear.py`).  
+    The session investigated storing u, Δu and the PCG solution accumulator x in
+    float16 or bfloat16 to save ~7 GB at 300 M voxels. Two fundamental blockers
+    were found and the option was removed entirely:
+
+    - **Float16 for p (CG direction) causes divergence.** The CG direction
+      vectors can grow large in ill-conditioned problems; float16 overflow
+      (max ≈ 65504) produces inf, zeroing alpha and stalling PCG permanently.
+      Fixing this by keeping p in float32 eliminates the overflow risk.
+
+    - **Float16 for u causes catastrophic cancellation in strain.** Even with p
+      in float32, returning u in float16 corrupts effective-modulus extraction:
+      per-element strain ε = u[i+1] − u[i] subtracts two nearly-equal values. In
+      the stiff phase of a C-contrast composite, the displacement increment per
+      element is C× smaller than the base displacement, amplifying float16 noise
+      by C in the strain and hence the reaction force. Measured: 44% error at
+      contrast 10; 962% error at contrast 1000. Float32 is required for any
+      physically meaningful stiffness extraction.
+
+    With the option removed the solver is simpler: no `astype` juggling in the
+    PCG loop, no `u_f32` upcast boilerplate in `_nr_step`/`_linear_step`, and no
+    BC-correction step on output. `_pcg_gpu` lost its `storage_dtype` parameter;
+    x is always float32 and `x += alpha * p` works directly.
 
 ### Test layout
 
