@@ -224,7 +224,9 @@ def test_gpu_vcycle_matches_cpu():
     z_cpu = gmg_cpu.apply(r)
     z_gpu = gmg_gpu.apply(cp.asarray(r)).get()
 
-    assert np.linalg.norm(z_gpu - z_cpu) <= 1e-4 * (np.linalg.norm(z_cpu) + 1e-30)
+    # GPU path stores E_elem as float16 (eps_rel ≈ 1e-3) while CPU uses float32,
+    # so the V-cycle outputs differ by O(eps_float16). Tolerance reflects this.
+    assert np.linalg.norm(z_gpu - z_cpu) <= 2e-3 * (np.linalg.norm(z_cpu) + 1e-30)
 
 
 @pytest.mark.skipif(not CUPY_AVAILABLE, reason="CuPy/GPU not available")

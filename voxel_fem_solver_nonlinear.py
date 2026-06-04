@@ -26,15 +26,14 @@ Constitutive models (via ConstitutiveModel):
   hardening : E_t = E0 · (1 + beta · eps_vm^n)
 
 GPU memory (300M elements, 48 GB VRAM):
-  E0_elem (float16, always):          0.6 GB
-  u, Δu, p — float16 (half_prec):    5.4 GB   (3 arrays × 1.8 GB)
-  f_int/R, Ap — float32:             7.2 GB   (2 arrays × 3.6 GB)
-  r, z — float32 (PCG residual):     7.2 GB   (2 arrays × 3.6 GB)
-  MG fine diagonal — float32:        3.6 GB
+  E0_elem (float16):                  0.6 GB
+  u, x/Δu, p, r, z (float32):       21.6 GB   (6 arrays × 3.6 GB)
+  f_int/R, Ap (float32):             7.2 GB   (2 arrays × 3.6 GB)
+  MG fine diagonal (float32):        3.6 GB
   MG coarse diagonals:               0.5 GB
-  Chunk working buffers (2M chunk):  ~1.0 GB
-  CuPy pool cache:                   ~1.0 GB
-  Total (half_precision=True):      ~26.5 GB ✓ (28 GB headroom at 48 GB)
+  Chunk working buffers (2M chunk): ~1.0 GB
+  CuPy pool cache:                  ~1.0 GB
+  Total:                            ~32 GB ✓ (16 GB headroom at 48 GB)
 
 Example
 -------
@@ -164,12 +163,6 @@ class VoxelFEMSolverNonlinear:
     max_pcg_iter : int — max PCG iterations per NR step (default 200)
     preconditioner : str — "multigrid" or "jacobi" (default "multigrid")
     gpu_chunk_size : int — elements per GPU chunk (default 2_000_000)
-    half_precision : bool — store u and Δu as float16 to reduce VRAM
-        (E0_elem is always float16 regardless). All arithmetic is float32;
-        p, r, z stay float32 to ensure PCG converges to tight tolerances.
-        Caution: float16 u has ~0.1% precision; reaction-force quantities
-        (e.g. effective modulus) are amplified by contrast and may lose
-        accuracy. Default False (float32 everywhere).
     verbose : bool — print NR/PCG progress (default True)
     """
 
@@ -189,7 +182,6 @@ class VoxelFEMSolverNonlinear:
         max_pcg_iter: int = 200,
         preconditioner: str = "multigrid",
         gpu_chunk_size: int = 2_000_000,
-        half_precision: bool = False,
         verbose: bool = True,
     ):
         assert voxels.ndim == 3 and voxels.dtype == np.uint8, \
@@ -208,8 +200,6 @@ class VoxelFEMSolverNonlinear:
         self.max_pcg_iter = max_pcg_iter
         self.preconditioner = preconditioner
         self.gpu_chunk_size = gpu_chunk_size
-        self.half_precision = half_precision
-        self._hp = cp.float16 if half_precision else cp.float32
         self.verbose = verbose
         self.pcg_print_interval = 10
         self._kappa_probe = 20
@@ -333,13 +323,13 @@ class VoxelFEMSolverNonlinear:
         if hasattr(self._precond, "set_bc_mask"):
             self._precond.set_bc_mask(self.bc_mask)
 
-        u_gpu = cp.zeros(self.Ndof, dtype=self._hp)
+        u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
 
         for step in range(1, self.n_load_steps + 1):
             lf = step / self.n_load_steps    # load fraction
 
             # Enforce displacement BCs at this load fraction (sparse scatter)
-            u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
+            u_gpu[bc_dofs_gpu] = lf * bc_vals_gpu
 
             if self.verbose:
                 print(f"\n=== Load step {step}/{self.n_load_steps} "
@@ -350,12 +340,7 @@ class VoxelFEMSolverNonlinear:
                 force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu,
             )
 
-        u_out = cp.asnumpy(u_gpu.astype(cp.float32))
-        # Restore exact float32 BC values: half-precision storage rounds them,
-        # but the caller expects the prescribed values to be exact.
-        if self._hp != cp.float32:
-            u_out[np.where(self.bc_mask)[0]] = self.bc_values[self.bc_mask]
-        return u_out
+        return cp.asnumpy(u_gpu)
 
     def _nr_step(self, u_gpu, lf, bc_mask_gpu, bc_dofs_gpu, bc_vals_gpu,
                  force_dofs_gpu, force_vals_gpu, _has_forces, free_gpu):
@@ -369,11 +354,8 @@ class VoxelFEMSolverNonlinear:
         f_norm_ref = None
 
         for k in range(self.max_nr_iter):
-            # Upcast solution to float32 for all arithmetic this iteration
-            u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
-
             f_int = compute_f_int_cupy(
-                u_f32, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
+                u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
                 self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
                 chunk_size=self.gpu_chunk_size,
             )
@@ -410,8 +392,7 @@ class VoxelFEMSolverNonlinear:
             # Update frozen-tangent multigrid for current u
             self._precond.update(u_gpu)
 
-            # Closure over float32 snapshot of u for the tangent matvec
-            def _matvec(v_gpu, _u=u_f32):
+            def _matvec(v_gpu, _u=u_gpu):
                 return matvec_tangent_cupy(
                     v_gpu, _u, self.E0_elem_gpu, self.B_gauss_gpu,
                     self.w_gauss_gpu, self.nu, self.constitutive,
@@ -426,17 +407,14 @@ class VoxelFEMSolverNonlinear:
             delta_u = self._pcg_gpu(
                 _matvec, R, _apply_precond, bc_mask_gpu,
                 tol=eta, max_iter=self.max_pcg_iter,
-                verbose=self.verbose, storage_dtype=self._hp,
+                verbose=self.verbose,
             )
             del R
 
-            # Update u in-place: upcast → add → downcast
-            u_f32 += delta_u.astype(cp.float32)
+            u_gpu += delta_u
             del delta_u
-            u_gpu = u_f32.astype(self._hp)
-            del u_f32
             # Enforce BC values (safeguard against floating-point drift)
-            u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
+            u_gpu[bc_dofs_gpu] = lf * bc_vals_gpu
 
             R_norm_prev = R_norm
 
@@ -456,10 +434,8 @@ class VoxelFEMSolverNonlinear:
         PCG is solved to tolerance.  This path skips the NR overhead entirely
         and uses tol_pcg directly instead of the Eisenstat-Walker criterion.
         """
-        u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
-
         f_int = compute_f_int_cupy(
-            u_f32, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
+            u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
             self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
             chunk_size=self.gpu_chunk_size,
         )
@@ -488,7 +464,7 @@ class VoxelFEMSolverNonlinear:
         # Build preconditioner once (no update needed — K is constant for linear)
         self._precond.update(u_gpu)
 
-        def _matvec(v, _u=u_f32):
+        def _matvec(v, _u=u_gpu):
             return matvec_tangent_cupy(
                 v, _u, self.E0_elem_gpu, self.B_gauss_gpu,
                 self.w_gauss_gpu, self.nu, self.constitutive,
@@ -499,15 +475,13 @@ class VoxelFEMSolverNonlinear:
         delta_u = self._pcg_gpu(
             _matvec, R, self._precond.apply, bc_mask_gpu,
             tol=self.tol_pcg, max_iter=self.max_pcg_iter,
-            verbose=self.verbose, storage_dtype=self._hp,
+            verbose=self.verbose,
         )
         del R
 
-        u_f32 += delta_u.astype(cp.float32)
+        u_gpu += delta_u
         del delta_u
-        u_gpu = u_f32.astype(self._hp)
-        del u_f32
-        u_gpu[bc_dofs_gpu] = (lf * bc_vals_gpu).astype(self._hp)
+        u_gpu[bc_dofs_gpu] = lf * bc_vals_gpu
         return u_gpu
 
     def _ew_tolerance(self, R_norm, R_norm_prev):
@@ -523,14 +497,9 @@ class VoxelFEMSolverNonlinear:
         return max(eta, self.tol_nr / 10.0)
 
     def _pcg_gpu(self, matvec, b_gpu, precond, bc_mask_gpu,
-                 tol=1e-6, max_iter=200, verbose=False,
-                 storage_dtype=cp.float32):
+                 tol=1e-6, max_iter=200, verbose=False):
         """
-        Preconditioned Conjugate Gradient with GPU-resident vectors.
-
-        r and Ap stay float32 for convergence accuracy.  x and p are stored in
-        storage_dtype (float32 or float16); they are upcast before every matvec
-        and dot product so arithmetic precision is unaffected.
+        Preconditioned Conjugate Gradient with GPU-resident float32 vectors.
 
         r is explicitly zeroed at constrained DOFs after every update, so
         cp.dot(r, r) gives ||r_free||² without extracting a sub-vector.
@@ -541,12 +510,8 @@ class VoxelFEMSolverNonlinear:
         b_gpu  : (Ndof,) float32 CuPy — right-hand side (zeroed at BC DOFs)
         precond : callable (Ndof,)→(Ndof,) — preconditioner M^{-1}
         bc_mask_gpu : (Ndof,) bool CuPy — constrained DOFs
-        storage_dtype : cp dtype — storage dtype for x and p (default float32)
         """
-        # x accumulates the solution in storage_dtype (float16 when half_precision).
-        # p, r, z stay float32 throughout — p in float16 overflows for
-        # poorly-conditioned problems and prevents convergence to tight tolerances.
-        x = cp.zeros(b_gpu.shape[0], dtype=storage_dtype)
+        x = cp.zeros(b_gpu.shape[0], dtype=cp.float32)
 
         def _Kfree(v):
             """K·v with identity rows for constrained DOFs (v must be float32)."""
@@ -588,10 +553,7 @@ class VoxelFEMSolverNonlinear:
             alpha = rz / (pAp + 1e-30)
             alphas.append(alpha)
 
-            # Update x: copy=False avoids redundant allocation when dtype matches
-            x_f32 = x.astype(cp.float32, copy=False)
-            x_f32 += alpha * p
-            x = x_f32.astype(storage_dtype, copy=False)
+            x += alpha * p
 
             r -= alpha * Ap                              # float32 in-place
             del Ap
