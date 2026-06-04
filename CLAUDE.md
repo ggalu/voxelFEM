@@ -280,15 +280,16 @@ practically useful contrast.
 
 ### GPU memory budget (300M elements, 48 GB VRAM)
 
-Measured on the layered example (multigrid preconditioner, clean baseline):
+Measured on the layered example (multigrid preconditioner, clean 64 MB baseline,
+all float32 — commits `a85425a` + `9560a16` + `60449df`):
 
 | Grid | Voxels | DOFs | Peak VRAM | bytes/DOF |
 |------|--------|------|-----------|-----------|
-| 100³ | 1 M    | 3.1 M  | 908 MB  | 308 |
-| 150³ | 3.4 M  | 10.3 M | 2.0 GB  | 207 |
-| 200³ | 8 M    | 24.4 M | 3.4 GB  | 146 |
+| 100³ | 1 M    | 3.1 M  | 904 MB  | 307 |
+| 150³ | 3.4 M  | 10.3 M | 1.9 GB  | 197 |
+| 200³ | 8 M    | 24.4 M | 2.7 GB  | 118 |
 
-bytes/DOF falls with grid size because the fixed chunk overhead (~1 GB for
+bytes/DOF falls with grid size because the fixed chunk overhead (~800 MB for
 `chunk_size=2 M`) dominates at small grids. At target scale it is negligible.
 
 **Projected budget at 300 M voxels (N≈669, Ndof≈902 M)**:
@@ -308,9 +309,17 @@ bytes/DOF falls with grid size because the fixed chunk overhead (~1 GB for
 | CuPy pool cache (retained blocks) | ~1.0 | unique alloc sizes, also constant |
 | **Total** | **~32 GB** ✓ | 16 GB headroom at 48 GB |
 
-**Capacity ceiling**: `VRAM ≈ 2 GB (fixed) + 32 B/DOF × Ndof`. For 48 GB
-available this gives a ceiling of ~480 M voxels (≈ 783³); with a 20 % safety
-margin ~385 M voxels (≈ 727³).
+**Capacity ceiling**: linear fit to the three measurements gives
+`VRAM ≈ 827 MB (fixed) + 251 MB/M_vox × Ne`. At 48 GB available:
+ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
+(note: small-scale fit over-estimates at target scale — see note below).
+
+> **Extrapolation caveat**: the fit is dominated by the fixed chunk
+> overhead (~800 MB, constant for `chunk_size=2 M`) which inflates the
+> apparent per-voxel slope. At 300 M voxels the chunk term is <1% of
+> total; the true asymptotic cost per DOF converges to ~32 B/DOF (6
+> float32 PCG vectors + diagonal + E0 + MG coarse), giving ~32 GB for
+> 300 M voxels — comfortably within the 48 GB budget.
 
 ### VRAM reduction techniques (commits `a85425a`, `9560a16`)
 
