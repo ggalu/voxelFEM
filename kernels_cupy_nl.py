@@ -30,6 +30,11 @@ except ImportError:
 from geometry import _B_matrix
 
 # 2×2×2 Gauss quadrature points and weights in [-1,1]
+# ---------------------------------------------------------------------------
+# NOTE: solid_mask_gpu (bool, shape (Ne,)) gates element contributions so that
+# void elements contribute exactly zero to f_int / K·v. Pass None (default)
+# to preserve the original behaviour (all elements active).
+# ---------------------------------------------------------------------------
 _GP = np.array([-1.0 / np.sqrt(3), 1.0 / np.sqrt(3)])
 _GW = np.array([1.0, 1.0])
 
@@ -62,6 +67,41 @@ def build_B_gauss():
                 gp_idx += 1
 
     return B_gauss, w_gauss
+
+
+def build_active_dof_gpu(solid_mask_gpu, Ny, Nz, Ndof, chunk_size=2_000_000):
+    """
+    Build active-DOF mask: True for every DOF whose node is touched by ≥1 solid element.
+
+    A node is active iff at least one of its 8 adjacent elements is solid.  DOFs
+    belonging only to void-element nodes are *inactive* — they carry no load and
+    should receive identity rows in the system operator.
+
+    Parameters
+    ----------
+    solid_mask_gpu : (Ne,) bool CuPy
+    Ny, Nz : int
+    Ndof : int
+    chunk_size : int
+
+    Returns
+    -------
+    active_dof : (Ndof,) bool CuPy
+    """
+    Ne = int(solid_mask_gpu.shape[0])
+    active_count = cp.zeros(Ndof, dtype=cp.int32)
+
+    for start in range(0, Ne, chunk_size):
+        end = min(start + chunk_size, Ne)
+        elem_ids = cp.arange(start, end, dtype=cp.int32)
+        dofs = _get_elem_dofs(elem_ids, Ny, Nz)    # (chunk, 24)
+        del elem_ids
+        solid_chunk = solid_mask_gpu[start:end]     # (chunk,) bool
+        solid_dofs = dofs[solid_chunk]              # (n_solid, 24) — empty if all void
+        cp.add.at(active_count, solid_dofs.ravel(), 1)
+        del dofs, solid_chunk, solid_dofs
+
+    return active_count > 0
 
 
 def _get_elem_dofs(elem_ids_gpu, Ny, Nz):
@@ -188,6 +228,7 @@ def compute_f_int_cupy(
     Ny, Nz,
     Ndof,
     chunk_size=2_000_000,
+    solid_mask_gpu=None,
 ):
     """
     Compute internal force vector  f_int = Σ_e Σ_gp  w · B^T · σ(ε).
@@ -256,6 +297,12 @@ def compute_f_int_cupy(
             f_loc += w * (sigma @ B)  # (chunk, 24)
             del sigma
 
+        # Zero contributions from void elements before scatter-adding
+        if solid_mask_gpu is not None:
+            solid_chunk = solid_mask_gpu[start:end]
+            f_loc *= solid_chunk[:, None].astype(cp.float32)
+            del solid_chunk
+
         # Atomic scatter-add to global f_int (handles repeated DOF indices)
         cp.add.at(f_int, dofs.ravel(), f_loc.ravel())
         del dofs, u_local, E0_chunk, f_loc
@@ -274,6 +321,7 @@ def matvec_tangent_cupy(
     Ny, Nz,
     Ndof,
     chunk_size=2_000_000,
+    solid_mask_gpu=None,
 ):
     """
     Compute K_tangent(u) · v without assembling K_tangent.
@@ -336,6 +384,12 @@ def matvec_tangent_cupy(
             # B^T @ D_t @ B @ v
             Kv_loc += w * (scaled @ B)  # (chunk, 24)
             del scaled
+
+        # Zero contributions from void elements before scatter-adding
+        if solid_mask_gpu is not None:
+            solid_chunk = solid_mask_gpu[start:end]
+            Kv_loc *= solid_chunk[:, None].astype(cp.float32)
+            del solid_chunk
 
         cp.add.at(Kv, dofs.ravel(), Kv_loc.ravel())
         del dofs, u_local, v_local, E0_chunk, Kv_loc

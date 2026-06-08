@@ -70,7 +70,8 @@ except ImportError:
     )
 
 from geometry import build_node_index
-from kernels_cupy_nl import build_B_gauss, compute_f_int_cupy, matvec_tangent_cupy
+from kernels_cupy_nl import (build_B_gauss, compute_f_int_cupy, matvec_tangent_cupy,
+                              build_active_dof_gpu)
 from constitutive import ConstitutiveModel
 from multigrid_nl import NonlinearMultigrid
 
@@ -153,6 +154,12 @@ class VoxelFEMSolverNonlinear:
         When provided, voxel values are treated as material IDs and E_void /
         E_max are ignored for E0 computation.  E_max is auto-set to the
         maximum value in the table unless explicitly passed.
+    solid_mask : np.ndarray (Nx, Ny, Nz) bool, optional
+        Binary solid/void map.  True → solid element carries load; False → void
+        element contributes exactly zero to f_int and K·v.  Active nodes are
+        those touched by ≥1 solid element; inactive DOFs receive identity rows
+        so they stay decoupled without compacting the DOF numbering.
+        None (default) preserves the original behaviour (all elements solid).
     is_linear : bool — if True, skip NR loop and run a single tight PCG
         solve.  Forces n_load_steps=1.  Use this for linear-elastic problems
         to avoid the overhead of the NR outer loop.
@@ -174,6 +181,7 @@ class VoxelFEMSolverNonlinear:
         E_void: float = 1e-6,
         constitutive: Optional[ConstitutiveModel] = None,
         material_table: Optional[np.ndarray] = None,
+        solid_mask: Optional[np.ndarray] = None,
         is_linear: bool = False,
         tol_pcg: float = 1e-8,
         n_load_steps: int = 10,
@@ -230,6 +238,34 @@ class VoxelFEMSolverNonlinear:
         self.E_max = E_max
         self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float16)
 
+        # Solid/void mask (Stage 1: binary void elimination).
+        # solid_elem_gpu : (Ne,) bool CuPy — True for load-bearing elements.
+        # inactive_dofs_gpu : (n_inactive,) int32 CuPy — DOFs not touched by
+        #   any solid element; these receive identity rows throughout the solve.
+        if solid_mask is not None:
+            assert (solid_mask.shape == voxels.shape
+                    and solid_mask.dtype == bool), \
+                "solid_mask must be a bool array with the same shape as voxels"
+            self.solid_elem_gpu = cp.asarray(solid_mask.ravel())
+            active_dof_gpu = build_active_dof_gpu(
+                self.solid_elem_gpu, self.Ny, self.Nz, self.Ndof,
+                chunk_size=gpu_chunk_size,
+            )
+            inactive_np = np.where(~cp.asnumpy(active_dof_gpu))[0].astype(np.int32)
+            self.inactive_dofs_gpu = cp.asarray(inactive_np)
+            del active_dof_gpu, inactive_np
+            if verbose:
+                n_solid = int(cp.count_nonzero(self.solid_elem_gpu))
+                n_inact = int(self.inactive_dofs_gpu.shape[0])
+                print(f"Solid elements: {n_solid:,} / {Ne:,} "
+                      f"({100*n_solid/Ne:.1f}%)")
+                print(f"Inactive DOFs: {n_inact:,} / {self.Ndof:,} "
+                      f"({100*n_inact/self.Ndof:.1f}%)")
+        else:
+            self.solid_elem_gpu = None
+            self.inactive_dofs_gpu = None
+        self._solid_mask_np = solid_mask   # kept for floating-island check
+
         # Precompute B_gauss matrices (CPU, then GPU)
         if verbose:
             print("Precomputing B_gauss ...", flush=True)
@@ -269,6 +305,11 @@ class VoxelFEMSolverNonlinear:
         diag = build_diagonal(E0_cpu, conn_dof, K_ref, self.Ndof)
         diag = np.where(diag < 1e-12, 1.0, diag)
         diag_inv_gpu = cp.asarray((1.0 / diag).astype(np.float32))
+        # Inactive DOFs (void-only nodes) must not be corrected by the
+        # preconditioner — set their inverse diagonal to 1 (identity).
+        if (self.inactive_dofs_gpu is not None
+                and self.inactive_dofs_gpu.shape[0] > 0):
+            diag_inv_gpu[self.inactive_dofs_gpu] = 1.0
 
         class _JacobiPrecond:
             def __init__(self, d):
@@ -316,11 +357,38 @@ class VoxelFEMSolverNonlinear:
         else:
             force_dofs_gpu = force_vals_gpu = None
 
+        # Build combined constrained-DOF array: BC DOFs ∪ inactive (void) DOFs.
+        # All these DOFs receive identity rows in the operator and are zeroed
+        # in the preconditioner output, so PCG keeps them exactly at zero.
+        if (self.inactive_dofs_gpu is not None
+                and self.inactive_dofs_gpu.shape[0] > 0):
+            all_constrained_gpu = cp.concatenate([bc_dofs_gpu,
+                                                  self.inactive_dofs_gpu])
+            all_constrained_np = np.concatenate(
+                [bc_dofs_np,
+                 cp.asnumpy(self.inactive_dofs_gpu).astype(np.int32)]
+            )
+        else:
+            all_constrained_gpu = bc_dofs_gpu
+            all_constrained_np = bc_dofs_np
+
         # Multigrid coarse operators are singular without the BCs that anchor
-        # the rigid-body modes; hand the preconditioner the constrained mask
-        # (known only now that apply_bc_displacement has been called).
+        # the rigid-body modes; hand the preconditioner the combined mask
+        # (BC + inactive) so inactive DOFs are also treated as identity rows
+        # at every multigrid level.
         if hasattr(self._precond, "set_bc_mask"):
-            self._precond.set_bc_mask(self.bc_mask)
+            combined_mask_np = np.zeros(self.Ndof, dtype=bool)
+            combined_mask_np[all_constrained_np] = True
+            self._precond.set_bc_mask(combined_mask_np)
+
+        # Store on self so _nr_step/_linear_step can access without a signature
+        # change — this avoids breaking tests that monkey-patch _nr_step with
+        # the original 7-argument signature.
+        self._all_constrained_gpu = all_constrained_gpu
+
+        # Warn about floating solid islands not anchored by any BC.
+        if self._solid_mask_np is not None:
+            self._check_floating_islands(bc_dofs_np)
 
         u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
 
@@ -344,9 +412,11 @@ class VoxelFEMSolverNonlinear:
     def _nr_step(self, u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
                  force_dofs_gpu, force_vals_gpu, _has_forces):
         """One load step: NR loop, or single PCG when is_linear=True."""
+        all_constrained_gpu = self._all_constrained_gpu
         if self.is_linear:
             return self._linear_step(u_gpu, lf, bc_dofs_gpu, bc_vals_gpu,
                                      force_dofs_gpu, force_vals_gpu, _has_forces)
+
 
         R_norm_prev = None
         f_norm_ref = None
@@ -356,10 +426,11 @@ class VoxelFEMSolverNonlinear:
                 u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
                 self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
                 chunk_size=self.gpu_chunk_size,
+                solid_mask_gpu=self.solid_elem_gpu,
             )
 
-            # Zero BC DOFs so norm(f_int) == norm(f_int[free]) without free_gpu.
-            f_int[bc_dofs_gpu] = 0.0
+            # Zero constrained DOFs (BC + inactive) so their norms are excluded.
+            f_int[all_constrained_gpu] = 0.0
 
             if f_norm_ref is None:
                 f_norm_int = float(cp.linalg.norm(f_int).get())
@@ -368,15 +439,14 @@ class VoxelFEMSolverNonlinear:
                 f_norm_ref = max(f_norm_ext, f_norm_int, 1e-30)
 
             # Build R = f_ext - f_int in-place in f_int's buffer (saves 1 Ndof alloc).
-            # f_int is already 0 at BC DOFs; negation preserves that.
             cp.negative(f_int, out=f_int)           # f_int ← -f_int
             if _has_forces:
                 cp.add.at(f_int, force_dofs_gpu, lf * force_vals_gpu)
-            f_int[bc_dofs_gpu] = 0.0               # re-zero after force scatter
+            f_int[all_constrained_gpu] = 0.0       # re-zero after force scatter
             R = f_int
             del f_int                               # drop alias; buffer lives via R
 
-            R_norm = float(cp.linalg.norm(R).get())  # R already 0 at BC DOFs
+            R_norm = float(cp.linalg.norm(R).get())
             rel_res = R_norm / f_norm_ref
 
             if self.verbose:
@@ -399,6 +469,7 @@ class VoxelFEMSolverNonlinear:
                     self.w_gauss_gpu, self.nu, self.constitutive,
                     self.Ny, self.Nz, self.Ndof,
                     chunk_size=self.gpu_chunk_size,
+                    solid_mask_gpu=self.solid_elem_gpu,
                 )
 
             def _apply_precond(r, _p=self._precond):
@@ -406,7 +477,7 @@ class VoxelFEMSolverNonlinear:
 
             # Inner PCG solve: K_t(u) · Δu = R
             delta_u = self._pcg_gpu(
-                _matvec, R, _apply_precond, bc_dofs_gpu,
+                _matvec, R, _apply_precond, all_constrained_gpu,
                 tol=eta, max_iter=self.max_pcg_iter,
                 verbose=self.verbose,
             )
@@ -435,29 +506,30 @@ class VoxelFEMSolverNonlinear:
         PCG is solved to tolerance.  This path skips the NR overhead entirely
         and uses tol_pcg directly instead of the Eisenstat-Walker criterion.
         """
+        all_constrained_gpu = self._all_constrained_gpu
         f_int = compute_f_int_cupy(
             u_gpu, self.E0_elem_gpu, self.B_gauss_gpu, self.w_gauss_gpu,
             self.nu, self.constitutive, self.Ny, self.Nz, self.Ndof,
             chunk_size=self.gpu_chunk_size,
+            solid_mask_gpu=self.solid_elem_gpu,
         )
 
-        # Zero BC DOFs so norm(f_int) == norm(f_int[free]) without free_gpu.
-        f_int[bc_dofs_gpu] = 0.0
+        # Zero constrained DOFs (BC + inactive) so their norms are excluded.
+        f_int[all_constrained_gpu] = 0.0
         f_norm_int = float(cp.linalg.norm(f_int).get())
         f_norm_ext = (lf * float(cp.linalg.norm(force_vals_gpu).get())
                       if _has_forces else 0.0)
         f_norm_ref = max(f_norm_int, f_norm_ext, 1e-30)
 
         # Build R = f_ext - f_int in-place in f_int's buffer.
-        # f_int is already 0 at BC DOFs; negation preserves that.
         cp.negative(f_int, out=f_int)
         if _has_forces:
             cp.add.at(f_int, force_dofs_gpu, lf * force_vals_gpu)
-        f_int[bc_dofs_gpu] = 0.0               # re-zero after force scatter
+        f_int[all_constrained_gpu] = 0.0       # re-zero after force scatter
         R = f_int
         del f_int
 
-        R_norm = float(cp.linalg.norm(R).get())  # R already 0 at BC DOFs
+        R_norm = float(cp.linalg.norm(R).get())
 
         if self.verbose:
             print(f"  Linear solve: ||R|| = {R_norm:.3e}  "
@@ -473,10 +545,11 @@ class VoxelFEMSolverNonlinear:
                 self.w_gauss_gpu, self.nu, self.constitutive,
                 self.Ny, self.Nz, self.Ndof,
                 chunk_size=self.gpu_chunk_size,
+                solid_mask_gpu=self.solid_elem_gpu,
             )
 
         delta_u = self._pcg_gpu(
-            _matvec, R, self._precond.apply, bc_dofs_gpu,
+            _matvec, R, self._precond.apply, all_constrained_gpu,
             tol=self.tol_pcg, max_iter=self.max_pcg_iter,
             verbose=self.verbose,
         )
@@ -486,6 +559,66 @@ class VoxelFEMSolverNonlinear:
         del delta_u
         u_gpu[bc_dofs_gpu] = lf * bc_vals_gpu
         return u_gpu
+
+    def _check_floating_islands(self, bc_dofs_np):
+        """
+        Detect solid islands not connected to any Dirichlet BC node.
+
+        Floating islands carry rigid-body null-space modes that stall CG.
+        Prints a warning listing island sizes; does not abort the solve.
+        Requires scipy (skipped with a warning if unavailable).
+        """
+        try:
+            from scipy import ndimage
+        except ImportError:
+            if self.verbose:
+                print("WARNING: scipy not available; floating-island check skipped.")
+            return
+
+        solid_3d = self._solid_mask_np.reshape(self.Nx, self.Ny, self.Nz)
+        # Use 26-connectivity: elements sharing even a corner share DOFs.
+        labeled, n_comps = ndimage.label(solid_3d, structure=np.ones((3, 3, 3)))
+        if n_comps == 0:
+            return
+
+        # Which nodes have at least one constrained DOF?
+        Nn = (self.Nx + 1) * (self.Ny + 1) * (self.Nz + 1)
+        constrained_node = np.zeros(Nn, dtype=bool)
+        constrained_node[bc_dofs_np // 3] = True
+        cn3d = constrained_node.reshape(self.Nx + 1, self.Ny + 1, self.Nz + 1)
+
+        # An element is "anchored" iff any of its 8 corner nodes is constrained.
+        ix = np.arange(self.Nx)[:, None, None]
+        iy = np.arange(self.Ny)[None, :, None]
+        iz = np.arange(self.Nz)[None, None, :]
+        anchored = (
+            cn3d[ix,   iy,   iz  ] | cn3d[ix+1, iy,   iz  ] |
+            cn3d[ix,   iy+1, iz  ] | cn3d[ix+1, iy+1, iz  ] |
+            cn3d[ix,   iy,   iz+1] | cn3d[ix+1, iy,   iz+1] |
+            cn3d[ix,   iy+1, iz+1] | cn3d[ix+1, iy+1, iz+1]
+        )  # (Nx, Ny, Nz) bool
+
+        # Mark components that contain at least one anchored solid element.
+        solid_and_anchored = solid_3d & anchored
+        anchored_comps = set(np.unique(labeled[solid_and_anchored]))
+        anchored_comps.discard(0)
+
+        floating_sizes = []
+        for cid in range(1, n_comps + 1):
+            if cid not in anchored_comps:
+                floating_sizes.append(int((labeled == cid).sum()))
+
+        if floating_sizes:
+            total = sum(floating_sizes)
+            sizes_str = str(sorted(floating_sizes, reverse=True)[:5])
+            if len(floating_sizes) > 5:
+                sizes_str = sizes_str[:-1] + ", ...]"
+            print(
+                f"\nWARNING: {len(floating_sizes)} floating solid island(s) detected "
+                f"(total {total} elements, sizes: {sizes_str}).\n"
+                f"  Floating islands have rigid-body null-space modes and will stall CG.\n"
+                f"  Consider removing specks below a size threshold or pinning their DOFs."
+            )
 
     def _ew_tolerance(self, R_norm, R_norm_prev):
         """
