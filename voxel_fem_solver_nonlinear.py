@@ -337,7 +337,7 @@ class VoxelFEMSolverNonlinear:
         global_dofs = np.asarray(node_ids) * 3 + np.asarray(dof_ids)
         np.add.at(self._f_ext, global_dofs, np.asarray(values, dtype=np.float32))
 
-    def solve(self):
+    def solve(self, u0=None):
         """
         Run Newton-Raphson with load stepping.
 
@@ -397,7 +397,10 @@ class VoxelFEMSolverNonlinear:
         if self._solid_mask_np is not None and not self._islands_checked:
             self._check_floating_islands(bc_dofs_np)
 
-        u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
+        if u0 is not None:
+            u_gpu = cp.asarray(u0, dtype=cp.float32)
+        else:
+            u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
 
         for step in range(1, self.n_load_steps + 1):
             lf = step / self.n_load_steps    # load fraction

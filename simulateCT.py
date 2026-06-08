@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 # @Author: Georg C. Ganzenmueller, Albert-Ludwigs Universitaet Freiburg, Germany
 # @Date:   2026-06-04 21:15:10
-# @Last Modified by:   Georg C. Ganzenmueller, Albert-Ludwigs Universitaet Freiburg, Germany
-# @Last Modified time: 2026-06-08 13:57:53
 #!/usr/bin/env python
 """
 Voxel FEM simulation of a CT-segmented sample
 ==============================================
 Loads ``exp_data.npz`` (keys: ``labels``, ``intensity``; shape 100×600×600),
 uses the ``labels`` array directly as Young's moduli (label value = E in GPa),
-and runs a single **linear-elastic** solve under 1% uniaxial tensile strain
-along the first dimension (x, length 100).
+and runs a single **linear-elastic** solve under 1% uniaxial tensile strain.
+Default loading axis is **z** (length 100).
+
+Affine initialisation
+---------------------
+The displacement field is seeded with the homogeneous affine solution
+``u_a = ε·x_a``, ``u_b = u_c = −ν·ε·x_{b,c}`` before the PCG solve starts.
+This is the exact solution for a homogeneous material and a good first guess
+for heterogeneous media, typically halving the required PCG iterations.
 
 Void/air elimination
 --------------------
@@ -22,18 +27,19 @@ and inactive DOFs stay exactly zero throughout the solve.
 
 Boundary conditions
 -------------------
-Tensile strain ``ε`` is applied along x by prescribing the x-displacement of
-the left face (x=0, u_x=0) and the right face (x=Nx, u_x=Δ).  The y and z
-faces are left free so the body contracts according to Poisson's ratio (ν=0.3);
-three minimal "3-2-1" anchor constraints remove residual rigid-body translations/
-rotation without restraining the lateral faces.  Because every voxel is a unit
-cube, the x-domain length equals Nx, so Δ = ε · Nx.
+Tensile strain ``ε`` is applied along the chosen axis by prescribing the
+displacement of both end-faces in that direction. The remaining four faces are
+left free so the body contracts according to Poisson's ratio (ν=0.3); three
+minimal "3-2-1" anchor constraints remove residual rigid-body translations/
+rotation without restraining the lateral faces. Because every voxel is a unit
+cube the domain length equals N_axis, so Δ = ε·N_axis.
 
 Usage
 -----
     python simulateCT.py
-    python simulateCT.py --strain 0.01 --preconditioner multigrid --smoother chebyshev
-    python simulateCT.py --vtk ct_result
+    python simulateCT.py --axis z --strain 0.01 --maxiter 200
+    python simulateCT.py --preconditioner multigrid --smoother chebyshev
+    python simulateCT.py --vtk ct_result --axis x
 """
 
 import argparse
@@ -63,6 +69,8 @@ LABEL_MODULI = {
 # Labels treated as void/air: removed from the FEM system via solid_mask.
 VOID_LABELS = {0, 255}
 
+_AXIS_NAMES = ["x", "y", "z"]
+
 
 # ---------------------------------------------------------------------------
 # Material table: label value -> Young's modulus
@@ -81,56 +89,90 @@ def build_label_material_table(label_moduli=LABEL_MODULI):
 
 
 # ---------------------------------------------------------------------------
-# Boundary conditions: x-tension, lateral faces free (3-2-1 anchoring)
+# Boundary conditions: uniaxial tension along `axis`, lateral faces free
 # ---------------------------------------------------------------------------
 
-def _face_nodes(node_idx, axis, idx):
-    sl = [slice(None)] * 3
-    sl[axis] = idx
-    return node_idx[tuple(sl)].ravel()
-
-
-def apply_uniaxial_x_bc(solver, node_idx, delta):
+def apply_uniaxial_bc(solver, node_idx, axis, delta):
     """
-    Prescribe x-displacement on the left (x=0) and right (x=Nx) faces,
-    leave y/z free, and anchor the transverse rigid-body modes minimally.
+    Prescribe displacement on the two end-faces along `axis` (0=x,1=y,2=z),
+    leave the remaining four faces free, and apply a minimal 3-2-1 anchor.
+
+    The 3-2-1 anchor fixes:
+      - transverse DOF b at the origin node            (kills b-translation)
+      - transverse DOF c at the origin node            (kills c-translation)
+      - transverse DOF c at the max-b corner node      (kills rotation about axis)
     """
-    a = 0              # load axis = x
-    b, c = 1, 2        # transverse axes = y, z
+    tr = [d for d in range(3) if d != axis]   # two transverse axes
+    b, c = tr[0], tr[1]
 
-    left  = _face_nodes(node_idx, a, 0)
-    right = _face_nodes(node_idx, a, -1)
-    solver.apply_bc_displacement(left,  np.full(len(left),  a), np.zeros(len(left)))
-    solver.apply_bc_displacement(right, np.full(len(right), a), np.full(len(right), delta))
+    sl_left  = [slice(None), slice(None), slice(None)]
+    sl_right = [slice(None), slice(None), slice(None)]
+    sl_left[axis]  = 0
+    sl_right[axis] = -1
+    left  = node_idx[tuple(sl_left)].ravel()
+    right = node_idx[tuple(sl_right)].ravel()
 
-    # Anchor the 3 transverse rigid-body modes (y-translation, z-translation,
-    # rotation about x) without restraining the lateral faces' axial freedom.
+    solver.apply_bc_displacement(left,  np.full(len(left),  axis), np.zeros(len(left)))
+    solver.apply_bc_displacement(right, np.full(len(right), axis), np.full(len(right), delta))
+
     origin = int(node_idx[0, 0, 0])
     solver.apply_bc_displacement(np.array([origin, origin]),
                                  np.array([b, c]), np.array([0.0, 0.0]))
-    ynode = int(node_idx[0, -1, 0])          # +y extreme: kills rotation about x
-    solver.apply_bc_displacement(np.array([ynode]), np.array([c]), np.array([0.0]))
+
+    # Fix c at the max-b corner to kill rotation about `axis`
+    idx_bmax = [0, 0, 0]
+    idx_bmax[b] = -1
+    bmax_node = int(node_idx[tuple(idx_bmax)])
+    solver.apply_bc_displacement(np.array([bmax_node]), np.array([c]), np.array([0.0]))
 
 
 # ---------------------------------------------------------------------------
-# Effective x-modulus from the right-face reaction
+# Affine homogeneous initial displacement field
 # ---------------------------------------------------------------------------
 
-def effective_modulus_x(u, material_table, voxels, nu, Nx, Ny, Nz, strain,
-                        solid_mask=None):
+def build_affine_u0(Nx, Ny, Nz, strain, nu, axis):
     """
-    E_eff = (F_x / A_total) / strain, where F_x is the summed x-reaction on
-    the right face (x=Nx) and A_total = Ny·Nz (unit-cube voxels, full face).
+    Build the exact displacement field for a homogeneous uniaxial strain ε:
 
-    solid_mask : (Nx,Ny,Nz) bool or None — if given, void elements contribute
-    zero to f_int (consistent with the solver's masking).
+        u_axis(node)        =  ε · coord_axis
+        u_transverse(node)  = −ν · ε · coord_transverse
+
+    This is the exact solution for a uniform material and a good first guess
+    for heterogeneous media, reducing the initial residual substantially.
+    """
+    Ndof = 3 * (Nx + 1) * (Ny + 1) * (Nz + 1)
+    u0 = np.zeros(Ndof, dtype=np.float32)
+
+    # C-order node indexing: flat node i has coordinates given by mgrid
+    ii, jj, kk = np.mgrid[0:Nx+1, 0:Ny+1, 0:Nz+1]
+    coords = [ii.ravel().astype(np.float32),
+              jj.ravel().astype(np.float32),
+              kk.ravel().astype(np.float32)]
+
+    u0[axis::3] = strain * coords[axis]
+    for d in range(3):
+        if d != axis:
+            u0[d::3] = -nu * strain * coords[d]
+
+    return u0
+
+
+# ---------------------------------------------------------------------------
+# Effective modulus from the reaction force on the loaded end-face
+# ---------------------------------------------------------------------------
+
+def effective_modulus(u, material_table, voxels, nu, axis, strain,
+                      solid_mask=None):
+    """
+    E_eff = (F_axis / A_total) / strain, where F_axis is the summed reaction
+    on the far face and A_total is the cross-sectional area perpendicular to
+    `axis` (unit-cube voxels, full face).
     """
     from constitutive import ConstitutiveModel
+    Nx, Ny, Nz = voxels.shape
     mat = ConstitutiveModel("linear", E_void=float(material_table.min()),
                             E_max=float(material_table.max()))
-    E0_cpu = material_table[voxels.ravel()].astype(np.float32)
-    E0_gpu = cp.asarray(E0_cpu)
-
+    E0_gpu = cp.asarray(material_table[voxels.ravel()].astype(np.float32))
     B_cpu, w_cpu = build_B_gauss()
     B_gpu = cp.asarray(B_cpu.astype(np.float32))
     w_gpu = cp.asarray(w_cpu.astype(np.float32))
@@ -142,14 +184,17 @@ def effective_modulus_x(u, material_table, voxels, nu, Nx, Ny, Nz, strain,
     f_int = compute_f_int_cupy(cp.asarray(u), E0_gpu, B_gpu, w_gpu,
                                nu, mat, Ny, Nz, Ndof,
                                solid_mask_gpu=solid_mask_gpu)
-    f_int = cp.asnumpy(f_int)
+    f_int_np = cp.asnumpy(f_int)
 
     node_idx = build_node_index(Nx, Ny, Nz)
-    right = node_idx[-1, :, :].ravel()          # x = Nx face
-    Fx = f_int[3 * right + 0].sum()             # DOF 0 = x-component
+    sl = [slice(None), slice(None), slice(None)]
+    sl[axis] = -1
+    far_face = node_idx[tuple(sl)].ravel()
+    F_reaction = f_int_np[3 * far_face + axis].sum()
 
-    area = Ny * Nz                               # total cross-section
-    return Fx / area / strain, Fx
+    dims = [Nx, Ny, Nz]
+    area = dims[(axis + 1) % 3] * dims[(axis + 2) % 3]
+    return F_reaction / area / strain, F_reaction
 
 
 # ---------------------------------------------------------------------------
@@ -158,31 +203,41 @@ def effective_modulus_x(u, material_table, voxels, nu, Nx, Ny, Nz, strain,
 
 def main():
     p = argparse.ArgumentParser(
-        description="Linear-elastic voxel FEM simulation of CT data, x-tension")
+        description="Linear-elastic voxel FEM simulation of CT data, uniaxial tension")
     p.add_argument("--data", default="exp_data.npz",
                    help="path to the .npz file with a 'labels' array (default exp_data.npz)")
+    p.add_argument("--axis", choices=["x", "y", "z"], default="z",
+                   help="loading axis (default z)")
     p.add_argument("--strain", type=float, default=0.01,
-                   help="applied uniaxial x-strain (default 0.01 = 1%%)")
+                   help="applied uniaxial strain (default 0.01 = 1%%)")
     p.add_argument("--nu", type=float, default=0.3,
                    help="Poisson ratio (default 0.3)")
+    p.add_argument("--maxiter", type=int, default=100,
+                   help="maximum PCG iterations (default 100)")
     p.add_argument("--preconditioner", choices=["jacobi", "multigrid"],
                    default="multigrid",
                    help="PCG preconditioner (default multigrid)")
     p.add_argument("--smoother", choices=["jacobi", "chebyshev"],
                    default="chebyshev",
-                   help="multigrid smoother (default chebyshev; ignored for --preconditioner jacobi)")
-    p.add_argument("--vtk", default="",
-                   help="if set, write per-voxel stress/strain VTK with this prefix")
+                   help="multigrid smoother (default chebyshev; "
+                        "ignored for --preconditioner jacobi)")
+    p.add_argument("--vtk", default="ct_result",
+                   help="write per-voxel stress/strain to <prefix>.vti "
+                        "(default 'ct_result'; set to '' to disable)")
     args = p.parse_args()
 
+    axis = {"x": 0, "y": 1, "z": 2}[args.axis]
+    aname = args.axis
+
     print("=" * 70)
-    print("  VOXEL FEM — CT data, linear elasticity, x-tension")
+    print(f"  VOXEL FEM — CT data, linear elasticity, {aname}-tension")
     print("=" * 70)
 
     # --- Load data -----------------------------------------------------------
     data = np.load(args.data)
     voxels = data["labels"].astype(np.uint8)
     Nx, Ny, Nz = voxels.shape
+    dims = [Nx, Ny, Nz]
     labels = np.unique(voxels)
     print(f"  Data  : {args.data}")
     print(f"  Grid  : {Nx}×{Ny}×{Nz} = {Nx*Ny*Nz:,} voxels")
@@ -197,7 +252,7 @@ def main():
     print(f"  Void/air voxels: {n_void:,} "
           f"(labels {sorted(VOID_LABELS)} — excluded from system)")
 
-    # --- Material table: label i -> E = float(i), label 0 -> void -----------
+    # --- Material table: label i -> E ----------------------------------------
     material_table = build_label_material_table(LABEL_MODULI)
     print("  Material table (label -> E):")
     for lbl in labels:
@@ -212,31 +267,27 @@ def main():
         solid_mask=solid_mask,
         is_linear=True,
         tol_pcg=1e-8,
-        max_pcg_iter=2000,
+        max_pcg_iter=args.maxiter,
         preconditioner=args.preconditioner,
         mg_smoother=args.smoother,
         verbose=True,
     )
 
-    # --- Boundary conditions: 1% x-tension, lateral faces free --------------
-    # Each voxel is a unit cube; x-domain length = Nx, so Δ = ε · Nx.
-    delta = args.strain * Nx
+    # --- Boundary conditions: uniaxial tension, lateral faces free ----------
+    # Domain length along loading axis = dims[axis] (unit cubes).
+    delta = args.strain * dims[axis]
     node_idx = build_node_index(Nx, Ny, Nz)
-    apply_uniaxial_x_bc(solver, node_idx, delta)
+    apply_uniaxial_bc(solver, node_idx, axis, delta)
 
-    print(f"\n  Applied x-strain : {args.strain*100:.2f}%  "
-          f"(right displacement Δ = {delta:.4f}, domain length Lx = {Nx})")
+    print(f"\n  Applied {aname}-strain  : {args.strain*100:.2f}%  "
+          f"(Δ = {delta:.4f}, L{aname} = {dims[axis]})")
     print(f"  Poisson ratio    : {args.nu}")
+    print(f"  Max PCG iters    : {args.maxiter}")
     print(f"  Preconditioner   : {args.preconditioner}")
     if args.preconditioner == "multigrid":
         print(f"  MG smoother      : {args.smoother}")
 
     # --- Floating-island diagnostic -----------------------------------------
-    # Run connected-component labeling on the solid mask now that BCs are
-    # known.  Any solid cluster not touching a Dirichlet node is a floating
-    # island: it has rigid-body null-space modes that would stall PCG.
-    # Calling the method here (before solve()) sets the _islands_checked flag
-    # so solve() skips the duplicate check.
     print()
     bc_dofs_np = np.where(solver.bc_mask)[0].astype(np.int32)
     n_comps, n_floating, island_sizes = solver._check_floating_islands(bc_dofs_np)
@@ -247,7 +298,6 @@ def main():
         print(f"  Isolated clusters  : 0  ({n_comps} solid component(s), "
               f"all anchored to Dirichlet BCs)")
     else:
-        # WARNING was already printed by _check_floating_islands above.
         total_elem = sum(island_sizes)
         top5 = sorted(island_sizes, reverse=True)[:5]
         tail = ", ...]" if len(island_sizes) > 5 else "]"
@@ -256,49 +306,52 @@ def main():
               f"have no BC contact  ({total_elem} elements, sizes {sizes_str})")
         print(f"  → Their DOFs are decoupled via the void mask and stay at zero.")
 
-    # --- Solve --------------------------------------------------------------
+    # --- Affine initial displacement field -----------------------------------
+    u0 = build_affine_u0(Nx, Ny, Nz, args.strain, args.nu, axis)
+    print(f"\n  Affine u0 seeded  : {aname}-displ range "
+          f"[{u0[axis::3].min():.4f}, {u0[axis::3].max():.4f}]")
+
+    # --- Solve ---------------------------------------------------------------
     t0 = time.perf_counter()
-    u = solver.solve()
+    u = solver.solve(u0=u0)
     cp.cuda.Device(0).synchronize()
     elapsed = time.perf_counter() - t0
 
-    # --- Report -------------------------------------------------------------
-    ux, uy, uz = u[0::3], u[1::3], u[2::3]
+    # --- Report --------------------------------------------------------------
+    disp = [u[0::3], u[1::3], u[2::3]]
     print(f"\n  {'─'*60}")
     print(f"  RESULTS")
     print(f"  {'─'*60}")
     print(f"  Solve time        : {elapsed:.2f} s")
-    print(f"  x-disp range      : [{ux.min():.6f}, {ux.max():.6f}]  "
-          f"(prescribed right Δ = {delta:.6f})")
-    print(f"  y-disp range      : [{uy.min():.6f}, {uy.max():.6f}]  (Poisson contraction)")
-    print(f"  z-disp range      : [{uz.min():.6f}, {uz.max():.6f}]  (Poisson contraction)")
+    for d, dname in enumerate(_AXIS_NAMES):
+        tag = f"(prescribed Δ = {delta:.6f})" if d == axis else "(Poisson contraction)"
+        print(f"  {dname}-disp range      : [{disp[d].min():.6f}, {disp[d].max():.6f}]  {tag}")
 
-    E_eff, Fx = effective_modulus_x(u, material_table, voxels, args.nu,
-                                    Nx, Ny, Nz, args.strain,
-                                    solid_mask=solid_mask)
+    E_eff, F_reaction = effective_modulus(u, material_table, voxels, args.nu,
+                                          axis, args.strain, solid_mask=solid_mask)
     non_void_labels = labels[~np.isin(labels, sorted(VOID_LABELS))]
     E_lo = material_table[non_void_labels].min() if len(non_void_labels) else 0.0
     E_hi = material_table[non_void_labels].max() if len(non_void_labels) else 0.0
-    print(f"\n  Right-face x-reaction : {Fx:.4f}")
-    print(f"  Effective E_x         : {E_eff:.4f}")
+    print(f"\n  Far-face {aname}-reaction   : {F_reaction:.4f}")
+    print(f"  Effective E_{aname}          : {E_eff:.4f}")
     print(f"  (solid phase moduli   : [{E_lo:.3f}, {E_hi:.3f}] — "
           f"E_eff should lie within or below)")
 
-    # --- Optional VTK -------------------------------------------------------
+    # --- VTI output (default on) --------------------------------------------
     if args.vtk:
         from tests.validation.report import (element_stress, element_strain,
                                              build_conn_dof)
-        from vtk_export import save_stress_strain_vtk
+        from vtk_export import save_stress_strain_vti
         conn = build_conn_dof(Nx, Ny, Nz)
         E0 = material_table[voxels.ravel()].astype(np.float32)
         strain_field = element_strain(u, conn)
         stress_field = element_stress(u, E0, conn, args.nu)
-        vtk_path = args.vtk if args.vtk.endswith(".vtk") else args.vtk + ".vtk"
-        save_stress_strain_vtk(vtk_path, (Nx, Ny, Nz), strain_field, stress_field,
+        vti_path = args.vtk if args.vtk.endswith(".vti") else args.vtk + ".vti"
+        save_stress_strain_vti(vti_path, (Nx, Ny, Nz), strain_field, stress_field,
                                extra={"label": voxels.ravel().astype(np.float64),
                                       "youngs_modulus": E0.astype(np.float64),
                                       "solid_mask": solid_mask.ravel().astype(np.float64)})
-        print(f"\n  Wrote VTK: {vtk_path}")
+        print(f"\n  Wrote VTI: {vti_path}")
 
     print(f"\n{'='*70}")
     print("  Simulation complete.")
