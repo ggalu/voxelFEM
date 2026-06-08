@@ -249,3 +249,128 @@ def test_gpu_pcg_matches_jacobi():
 
     assert np.linalg.norm(x_m - x_ref) / (np.linalg.norm(x_ref) + 1e-30) < 1e-3
     assert it_m < it_j
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Chebyshev smoother tests
+# ---------------------------------------------------------------------------
+
+def _build_layered_high_contrast(N=20, nu=0.3, E_max=1.0, E_void=1e-6, contrast=100):
+    """
+    Two-phase layered composite: first z-half at E_max, second at E_max/contrast.
+
+    Contrast 100 is large enough that Jacobi-smoothed GMG stalls (>500 iters)
+    while Chebyshev-smoothed GMG converges in ~24 iters — a clear benchmark.
+    """
+    voxels = np.zeros((N, N, N), dtype=np.uint8)
+    voxels[:, :, :N // 2] = 255
+    voxels[:, :, N // 2:] = max(1, int(255 / contrast))
+    Ndof = 3 * (N + 1) ** 3
+    K_ref = build_K_ref(nu)
+    node_idx = build_node_index(N, N, N)
+    conn_nodes = element_node_ids(node_idx, N, N, N)
+    conn_dof = (conn_nodes[:, :, None] * 3
+                + np.array([0, 1, 2], dtype=np.int32)).reshape(-1, 24)
+    E_scale = (E_max - E_void) / 255.0
+    E_elem = voxels.ravel().astype(np.float32) * E_scale + E_void
+
+    bc_mask = np.zeros(Ndof, dtype=bool)
+    bc_val = np.zeros(Ndof, dtype=np.float32)
+    delta = 1e-3 * N
+    low = node_idx[:, :, 0].ravel()
+    high = node_idx[:, :, -1].ravel()
+    bc_mask[low * 3 + 2] = True
+    bc_mask[high * 3 + 2] = True
+    bc_val[high * 3 + 2] = delta
+    o = int(node_idx[0, 0, 0])
+    bc_mask[o * 3 + 0] = True
+    bc_mask[o * 3 + 1] = True
+    bc_mask[int(node_idx[-1, 0, 0]) * 3 + 1] = True
+
+    def matvec(u):
+        return matvec_Ku(u, E_elem, conn_dof, K_ref, Ndof)
+
+    u_bc = np.zeros(Ndof, dtype=np.float32)
+    u_bc[bc_mask] = bc_val[bc_mask]
+    b = -matvec(u_bc)
+    b[bc_mask] = bc_val[bc_mask]
+
+    diag = build_diagonal(E_elem, conn_dof, K_ref, Ndof)
+    diag = np.where(diag < 1e-12, 1.0, diag)
+    jac_inv = (1.0 / diag).astype(np.float32)
+
+    return dict(N=N, nu=nu, E_max=E_max, E_void=E_void, voxels=voxels,
+                Ndof=Ndof, matvec=matvec, b=b, bc_mask=bc_mask, jac_inv=jac_inv)
+
+
+def test_chebyshev_fewer_iters_than_jacobi():
+    """
+    Chebyshev-smoothed GMG converges in fewer PCG iterations than
+    Jacobi-smoothed GMG on a high-contrast (100:1) layered composite.
+
+    At contrast 100 the Jacobi smoother cannot adequately damp the stiff
+    phase's high-frequency modes, so the V-cycle loses effectiveness and
+    PCG stalls (>500 iters). The Chebyshev polynomial smoother, with its
+    optimal spectral coverage of [lam_max/c, lam_max], converges in ~24.
+    """
+    prob = _build_layered_high_contrast(N=20, contrast=100)
+
+    gmg_jac = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], smoother="jacobi",
+    )
+    gmg_cheb = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], smoother="chebyshev",
+    )
+
+    _, it_jac  = _pcg(prob, gmg_jac.apply,  max_iter=500)
+    _, it_cheb = _pcg(prob, gmg_cheb.apply, max_iter=500)
+
+    print(f"Contrast 100 — Jacobi GMG: {it_jac} iters,  Chebyshev GMG: {it_cheb} iters")
+
+    assert it_cheb < it_jac, (
+        f"Chebyshev GMG ({it_cheb}) should use fewer PCG iters than "
+        f"Jacobi GMG ({it_jac}) on a contrast-100 problem"
+    )
+    # Chebyshev must actually converge (not just be less bad than Jacobi)
+    assert it_cheb < 500, f"Chebyshev GMG did not converge: {it_cheb} == max_iter"
+    print(f"✓ Chebyshev uses {it_jac - it_cheb} fewer PCG iters than Jacobi")
+
+
+def test_chebyshev_same_solution_as_jacobi():
+    """
+    Chebyshev-smoothed GMG converges to the same solution as Jacobi-smoothed
+    GMG on a contrast-10 layered problem (both converge to 1e-8 tolerance).
+
+    The two preconditioners change convergence rate, not the fixed point.
+    """
+    prob = _build_layered_high_contrast(N=20, contrast=10)
+
+    gmg_jac = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], smoother="jacobi",
+    )
+    gmg_cheb = GeometricMultigrid(
+        prob["voxels"], prob["nu"], prob["E_max"], prob["E_void"],
+        n_pre=2, n_post=2, bc_mask=prob["bc_mask"], smoother="chebyshev",
+    )
+
+    x_jac,  it_jac  = _pcg(prob, gmg_jac.apply)
+    x_cheb, it_cheb = _pcg(prob, gmg_cheb.apply)
+
+    rel_diff = (np.linalg.norm(x_cheb - x_jac)
+                / (np.linalg.norm(x_jac) + 1e-30))
+    print(f"Contrast 10 — Jacobi: {it_jac} iters,  Chebyshev: {it_cheb} iters,  "
+          f"rel diff = {rel_diff:.2e}")
+
+    assert rel_diff < 1e-3, (
+        f"Chebyshev and Jacobi solutions differ by {rel_diff:.2e} "
+        f"(expected < 1e-3)"
+    )
+    assert it_cheb < it_jac, (
+        f"Chebyshev ({it_cheb}) should converge in fewer iters than "
+        f"Jacobi ({it_jac}) even at contrast 10"
+    )
+    print(f"✓ Solutions agree to {rel_diff:.1e}; "
+          f"Chebyshev uses {it_jac - it_cheb} fewer iters")

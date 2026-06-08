@@ -163,6 +163,8 @@ class GeometricMultigrid:
         bc_mask: np.ndarray = None,
         use_gpu: bool = False,
         chunk_size: int = 2_000_000,
+        smoother: str = "jacobi",
+        chebyshev_c_ratio: float = 20.0,
     ):
         if use_gpu and not CUPY_AVAILABLE:
             raise RuntimeError("use_gpu=True requires CuPy, which is not available")
@@ -178,6 +180,9 @@ class GeometricMultigrid:
         self.n_post = n_post
         self.coarse_solver = coarse_solver
         self.verbose = False
+        self.smoother = smoother
+        self.chebyshev_c_ratio = chebyshev_c_ratio
+        self._lambda_max_cache = {}  # {id(level): estimated lam_max}
 
         # Build multigrid hierarchy
         self.levels = []
@@ -340,6 +345,85 @@ class GeometricMultigrid:
 
         return u
 
+    def _estimate_lambda_max(self, level):
+        """
+        Estimate the largest eigenvalue of D⁻¹A on this level via 10 power
+        iterations.  Used to set the Chebyshev smoothing interval.
+        """
+        xp = level.xp
+        rng = np.random.default_rng(42)
+        v = xp.asarray(rng.standard_normal(level.Ndof).astype(np.float32))
+        if level.bc_mask is not None:
+            v[level.bc_mask] = 0.0
+        nrm = float(xp.linalg.norm(v))
+        if nrm < 1e-30:
+            return 1.0
+        v = v / nrm
+
+        lam = 1.0
+        for _ in range(10):
+            w = level.matvec(v)
+            if level.bc_mask is not None:
+                w[level.bc_mask] = 0.0
+            w *= level.diag_inv
+            if level.bc_mask is not None:
+                w[level.bc_mask] = 0.0
+            lam = float(xp.dot(v, w))
+            nrm = float(xp.linalg.norm(w))
+            if nrm < 1e-30:
+                break
+            v = w / nrm
+
+        return max(lam * 1.1, 1e-10)
+
+    def _get_lambda_max(self, level):
+        """Return cached lambda_max estimate for D⁻¹A on this level."""
+        key = id(level)
+        if key not in self._lambda_max_cache:
+            self._lambda_max_cache[key] = self._estimate_lambda_max(level)
+        return self._lambda_max_cache[key]
+
+    def _smooth_chebyshev(self, level, u, f, n_sweeps):
+        """
+        Jacobi-preconditioned Chebyshev polynomial smoother.
+
+        Applies n_sweeps Richardson steps with step sizes 1/omega_j, where
+        omega_j are the Chebyshev nodes of T_n on [lam_max/c_ratio, lam_max].
+        This gives the optimal degree-n polynomial smoother on the high-
+        frequency interval [lam_max/c_ratio, lam_max] of D⁻¹A, while leaving
+        smooth modes (eigenvalues near 0) undisturbed.
+
+        Inactive / constrained DOFs have diag_inv = 1 and are zeroed in the
+        residual, so they remain at zero throughout (mask-aware by design).
+        """
+        xp = level.xp
+        lam_max = self._get_lambda_max(level)
+        lam_min = lam_max / self.chebyshev_c_ratio
+
+        center = (lam_max + lam_min) / 2.0
+        half_w = (lam_max - lam_min) / 2.0
+        j = np.arange(1, n_sweeps + 1)
+        omegas = center + half_w * np.cos(np.pi * (2 * j - 1) / (2 * n_sweeps))
+
+        for omega in omegas:
+            r = f - level.matvec(u)
+            if level.bc_mask is not None:
+                r[level.bc_mask] = 0.0
+            z = level.diag_inv * r
+            if level.bc_mask is not None:
+                z[level.bc_mask] = 0.0
+            z *= 1.0 / float(omega)
+            u += z
+            del r, z
+
+        return u
+
+    def _smooth_dispatch(self, level, u, f, n_iter):
+        """Route to Chebyshev or Jacobi smoother based on self.smoother."""
+        if self.smoother == "chebyshev":
+            return self._smooth_chebyshev(level, u, f, n_iter)
+        return self._smooth(level, u, f, n_iter, copy_input=False)
+
     def vcycle(self, r: np.ndarray, level_idx: int = 0) -> np.ndarray:
         """
         Perform one V-cycle. Returns approximate solution e to K·e = r.
@@ -357,8 +441,7 @@ class GeometricMultigrid:
         coarse = self.levels[level_idx + 1]
 
         # Pre-smooth (zeros_like is freshly allocated — no copy needed)
-        e = self._smooth(level, self.xp.zeros_like(r), r, self.n_pre,
-                         copy_input=False)
+        e = self._smooth_dispatch(level, self.xp.zeros_like(r), r, self.n_pre)
 
         # Restrict residual; zero constrained coarse DOFs (full weighting mixes
         # in free neighbours, so the coarse residual must be re-masked).
@@ -379,7 +462,7 @@ class GeometricMultigrid:
         del e_correction
 
         # Post-smooth (e is freshly allocated above — no copy needed)
-        e = self._smooth(level, e, r, self.n_post, copy_input=False)
+        e = self._smooth_dispatch(level, e, r, self.n_post)
 
         return e
 
