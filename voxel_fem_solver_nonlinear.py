@@ -279,6 +279,7 @@ class VoxelFEMSolverNonlinear:
         self.bc_mask = np.zeros(self.Ndof, dtype=bool)
         self.bc_values = np.zeros(self.Ndof, dtype=np.float32)
         self._f_ext = np.zeros(self.Ndof, dtype=np.float32)
+        self._islands_checked = False    # set True once _check_floating_islands runs
 
         # Build preconditioner
         if preconditioner == "multigrid":
@@ -391,7 +392,9 @@ class VoxelFEMSolverNonlinear:
         self._all_constrained_gpu = all_constrained_gpu
 
         # Warn about floating solid islands not anchored by any BC.
-        if self._solid_mask_np is not None:
+        # Skipped if already called externally (e.g. from simulateCT.py) to
+        # avoid printing the same WARNING twice.
+        if self._solid_mask_np is not None and not self._islands_checked:
             self._check_floating_islands(bc_dofs_np)
 
         u_gpu = cp.zeros(self.Ndof, dtype=cp.float32)
@@ -569,21 +572,29 @@ class VoxelFEMSolverNonlinear:
         Detect solid islands not connected to any Dirichlet BC node.
 
         Floating islands carry rigid-body null-space modes that stall CG.
-        Prints a warning listing island sizes; does not abort the solve.
-        Requires scipy (skipped with a warning if unavailable).
+        Prints a warning listing island sizes if any are found; does not abort
+        the solve.  Requires scipy (skipped with a warning if unavailable).
+
+        Returns
+        -------
+        n_comps : int  — total number of solid connected components
+        n_floating : int  — number of components not anchored to any BC node
+        floating_sizes : list[int]  — element count per floating component
         """
+        self._islands_checked = True
+
         try:
             from scipy import ndimage
         except ImportError:
             if self.verbose:
                 print("WARNING: scipy not available; floating-island check skipped.")
-            return
+            return 0, 0, []
 
         solid_3d = self._solid_mask_np.reshape(self.Nx, self.Ny, self.Nz)
         # Use 26-connectivity: elements sharing even a corner share DOFs.
         labeled, n_comps = ndimage.label(solid_3d, structure=np.ones((3, 3, 3)))
         if n_comps == 0:
-            return
+            return 0, 0, []
 
         # Which nodes have at least one constrained DOF?
         Nn = (self.Nx + 1) * (self.Ny + 1) * (self.Nz + 1)
@@ -623,6 +634,8 @@ class VoxelFEMSolverNonlinear:
                 f"  Floating islands have rigid-body null-space modes and will stall CG.\n"
                 f"  Consider removing specks below a size threshold or pinning their DOFs."
             )
+
+        return n_comps, len(floating_sizes), floating_sizes
 
     def _ew_tolerance(self, R_norm, R_norm_prev):
         """

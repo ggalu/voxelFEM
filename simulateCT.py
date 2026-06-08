@@ -229,9 +229,32 @@ def main():
     print(f"  Poisson ratio    : {args.nu}")
     print(f"  Preconditioner   : {args.preconditioner}")
     if args.preconditioner == "multigrid":
-        print(f"  MG smoother      : {args.smoother}\n")
+        print(f"  MG smoother      : {args.smoother}")
+
+    # --- Floating-island diagnostic -----------------------------------------
+    # Run connected-component labeling on the solid mask now that BCs are
+    # known.  Any solid cluster not touching a Dirichlet node is a floating
+    # island: it has rigid-body null-space modes that would stall PCG.
+    # Calling the method here (before solve()) sets the _islands_checked flag
+    # so solve() skips the duplicate check.
+    print()
+    bc_dofs_np = np.where(solver.bc_mask)[0].astype(np.int32)
+    n_comps, n_floating, island_sizes = solver._check_floating_islands(bc_dofs_np)
+
+    if n_comps == 0:
+        print("  Isolated clusters  : solid mask is empty — nothing to check")
+    elif n_floating == 0:
+        print(f"  Isolated clusters  : 0  ({n_comps} solid component(s), "
+              f"all anchored to Dirichlet BCs)")
     else:
-        print()
+        # WARNING was already printed by _check_floating_islands above.
+        total_elem = sum(island_sizes)
+        top5 = sorted(island_sizes, reverse=True)[:5]
+        tail = ", ...]" if len(island_sizes) > 5 else "]"
+        sizes_str = str(top5)[:-1] + tail
+        print(f"  Isolated clusters  : {n_floating} of {n_comps} solid component(s) "
+              f"have no BC contact  ({total_elem} elements, sizes {sizes_str})")
+        print(f"  → Their DOFs are decoupled via the void mask and stay at zero.")
 
     # --- Solve --------------------------------------------------------------
     t0 = time.perf_counter()
