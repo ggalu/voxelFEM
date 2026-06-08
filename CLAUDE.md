@@ -41,8 +41,8 @@ python tests/validation/report.py
 
 # Example scripts (CuPy/GPU required)
 # Multi-material: --preconditioner {jacobi,multigrid}, writes per-voxel .vti
-# (use jacobi here — the random/checkerboard patterns oscillate at the voxel
-# scale and stall geometric multigrid; see "Multigrid preconditioner" notes).
+# (use jacobi here — the strict random/checkerboard patterns have per-voxel
+# alternating moduli (κ ~ 1e31) and stall geometric multigrid; see notes).
 python example_multimaterial.py --pattern checkerboard --size 80 --preconditioner jacobi
 python example_multimaterial.py --pattern random --vtk mm --format vti
 python example_nonlinear.py
@@ -239,11 +239,18 @@ parallel case: 31 vs 1083). Correctness is locked in by `tests/test_multigrid.py
 (adjoint property, convergent V-cycle, PCG agreement with Jacobi).
 
 **Suitability caveat**: this is *geometric* multigrid — it coarsens by 2×2×2
-averaging of the stiffness image. It shines when the stiffness varies smoothly or
-structurally (layered, graded), but **stalls on coefficients that oscillate at
-the voxel scale** (the `example_multimaterial.py` random/checkerboard patterns):
-those average out under coarsening, so coarse grids cannot represent the fine
-jumps and the V-cycle loses its coarse correction. Use Jacobi there. A
+averaging of the stiffness image. It shines when the stiffness varies smoothly,
+structurally (layered, graded), or in spatially coherent clusters (e.g. fibrous
+CT microstructures). It **stalls on strictly alternating per-voxel moduli**
+(the `example_multimaterial.py` pure random/checkerboard patterns, where every
+neighbour has a different modulus): those cancel under 2×2×2 averaging so the
+coarse grid loses all stiffness variation, κ collapses to ~1e31, and the V-cycle
+contributes nothing. Use Jacobi for those patterns. By contrast, a fibrous
+microstructure like `exp_data.npz` (fibers form multi-voxel clusters, contrast
+10:1) converges in ~30 PCG iters with multigrid while plain Jacobi fails to
+converge in 500 iters — so for realistic CT data, multigrid is the right choice
+and Jacobi should be avoided. The distinguishing criterion is not "voxel-scale
+variation" but whether coarse averaging retains a meaningful effective medium. A
 non-converged inner PCG (max_iter reached without hitting tol) now prints a
 visible `⚠ PCG did NOT converge` warning rather than silently returning a wrong
 field.
