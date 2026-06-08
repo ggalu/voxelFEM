@@ -398,7 +398,7 @@ def matvec_tangent_cupy(
 
 
 def matvec_Ku_cupy(u_gpu, E_elem_gpu, K_ref_gpu, Ny, Nz, Ndof,
-                   chunk_size=2_000_000):
+                   chunk_size=2_000_000, solid_mask_gpu=None):
     """
     Linear matrix-free product  f = K·u  with a constant reference stiffness.
 
@@ -410,11 +410,12 @@ def matvec_Ku_cupy(u_gpu, E_elem_gpu, K_ref_gpu, Ny, Nz, Ndof,
     Parameters
     ----------
     u_gpu : (Ndof,) float32 CuPy
-    E_elem_gpu : (Ne,) float32 CuPy — per-element modulus (already scaled)
+    E_elem_gpu : (Ne,) float32 or float16 CuPy — per-element modulus
     K_ref_gpu : (24, 24) float32 CuPy — reference element stiffness
     Ny, Nz : int — grid dimensions of this level
     Ndof : int
     chunk_size : int
+    solid_mask_gpu : (Ne,) bool CuPy, optional — void elements contribute zero
 
     Returns
     -------
@@ -435,6 +436,9 @@ def matvec_Ku_cupy(u_gpu, E_elem_gpu, K_ref_gpu, Ny, Nz, Ndof,
         Ku_loc = cp.einsum('ij,cj->ci', K_ref_gpu, u_loc)  # (chunk, 24)
         del u_loc
         Ku_loc *= E_elem_gpu[start:end, None]
+
+        if solid_mask_gpu is not None:
+            Ku_loc *= solid_mask_gpu[start:end, None].astype(cp.float32)
 
         cp.add.at(f, dofs.ravel(), Ku_loc.ravel())
         del dofs, Ku_loc

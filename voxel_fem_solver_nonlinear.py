@@ -698,7 +698,8 @@ class VoxelFEMSolverNonlinear:
         kappa_est        = None
 
         if verbose:
-            print(f"    {'iter':>5}  {'residual':>11}  {'rate(10)':>9}  {'ETA':>6}")
+            print(f"    {'iter':>5}  {'residual':>11}  {'rate(10)':>9}  {'ETA':>6}",
+                  flush=True)
 
         res = 1.0
         for it in range(max_iter):
@@ -742,10 +743,12 @@ class VoxelFEMSolverNonlinear:
                 rate, eta = _rate_and_eta(res_history, res, tol)
                 r_str   = f"{rate:.4f}" if rate is not None else "       —"
                 eta_str = str(eta)       if eta  is not None else "     —"
-                print(f"    {it:>5}  {res:>11.3e}  {r_str:>9}  {eta_str:>6}")
+                print(f"    {it:>5}  {res:>11.3e}  {r_str:>9}  {eta_str:>6}",
+                      flush=True)
 
             if res < tol:
-                print(f"    PCG converged at iter {it},  residual = {res:.3e}")
+                print(f"    PCG converged at iter {it},  residual = {res:.3e}",
+                      flush=True)
                 del z
                 break
 
@@ -757,6 +760,6 @@ class VoxelFEMSolverNonlinear:
             rz = rz_new
         else:
             print(f"    ⚠ PCG did NOT converge: {max_iter} iters, "
-                  f"rel.residual = {res:.3e} (tol {tol:.1e})")
+                  f"rel.residual = {res:.3e} (tol {tol:.1e})", flush=True)
 
         return x

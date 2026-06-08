@@ -197,10 +197,10 @@ class GeometricMultigrid:
 
             if n_levels and len(self.levels) >= n_levels:
                 break
-            if min(img.shape) < 4:
+            if max(img.shape) < 4:
                 break
 
-            img = self._coarsen_image(img)
+            img = self._coarsen_image_anisotropic(img)
             level_idx += 1
 
         # Propagate the fine constrained-DOF mask down the hierarchy so every
@@ -256,6 +256,31 @@ class GeometricMultigrid:
             starts = np.arange(0, n, 2)
             block_sum = np.add.reduceat(a, starts, axis=axis)
             counts = np.add.reduceat(np.ones(n), starts)   # 2 per group, 1 if odd tail
+            shape = [1, 1, 1]
+            shape[axis] = len(starts)
+            a = block_sum / counts.reshape(shape)
+        return np.clip(a + 0.5, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _coarsen_image_anisotropic(img: np.ndarray) -> np.ndarray:
+        """
+        Coarsen only dimensions whose current size is ≥ 4; freeze smaller ones.
+
+        For strongly anisotropic grids (e.g. 450×450×20) the thin dimension
+        exhausts first under uniform 2×2×2 coarsening, capping the hierarchy at
+        4 levels.  This method keeps coarsening the large dimensions even after
+        the thin one becomes ≤ 3, growing the hierarchy until max(shape) < 4.
+        Thin dimensions (size < 4) are kept at their current size so the element
+        geometry remains non-degenerate.
+        """
+        a = img.astype(np.float64)
+        for axis in range(3):
+            n = a.shape[axis]
+            if n < 4:
+                continue            # freeze this dimension
+            starts = np.arange(0, n, 2)
+            block_sum = np.add.reduceat(a, starts, axis=axis)
+            counts = np.add.reduceat(np.ones(n), starts)
             shape = [1, 1, 1]
             shape[axis] = len(starts)
             a = block_sum / counts.reshape(shape)
