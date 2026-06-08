@@ -47,7 +47,8 @@ class NonlinearMultigrid:
     def __init__(self, voxels, nu, E_max, E_void, constitutive,
                  B_gauss_gpu, E0_elem_gpu,
                  n_levels=None, n_pre=2, n_post=2, chunk_size=2_000_000,
-                 bc_mask=None, use_gpu=None):
+                 bc_mask=None, use_gpu=None,
+                 smoother="jacobi", chebyshev_c_ratio=20.0):
         self.base_voxels = voxels.copy()
         self.nu = nu
         self.E_max = E_max
@@ -62,9 +63,9 @@ class NonlinearMultigrid:
         # Run the whole V-cycle on the GPU when CuPy is available, so each PCG
         # iteration applies the preconditioner without a host round-trip.
         self.use_gpu = CUPY_AVAILABLE if use_gpu is None else use_gpu
-        # Fine-grid constrained-DOF mask; without it the coarse operators are
-        # singular and the V-cycle diverges. Set via set_bc_mask() before solve.
         self.bc_mask = bc_mask
+        self.smoother = smoother
+        self.chebyshev_c_ratio = chebyshev_c_ratio
 
         self.Nx, self.Ny, self.Nz = voxels.shape
 
@@ -73,6 +74,7 @@ class NonlinearMultigrid:
             voxels, nu, E_max, E_void,
             n_levels=n_levels, n_pre=n_pre, n_post=n_post, bc_mask=self.bc_mask,
             use_gpu=self.use_gpu, chunk_size=self.chunk_size,
+            smoother=self.smoother, chebyshev_c_ratio=self.chebyshev_c_ratio,
         )
 
     def set_bc_mask(self, bc_mask):
@@ -132,6 +134,7 @@ class NonlinearMultigrid:
             n_levels=self.n_levels, n_pre=self.n_pre, n_post=self.n_post,
             bc_mask=self.bc_mask,
             use_gpu=self.use_gpu, chunk_size=self.chunk_size,
+            smoother=self.smoother, chebyshev_c_ratio=self.chebyshev_c_ratio,
         )
 
     def apply(self, r):

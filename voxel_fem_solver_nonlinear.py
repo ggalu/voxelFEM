@@ -191,6 +191,8 @@ class VoxelFEMSolverNonlinear:
         preconditioner: str = "multigrid",
         gpu_chunk_size: int = 2_000_000,
         verbose: bool = True,
+        mg_smoother: str = "jacobi",
+        mg_chebyshev_c_ratio: float = 20.0,
     ):
         assert voxels.ndim == 3 and voxels.dtype == np.uint8, \
             "voxels must be a 3D uint8 array"
@@ -286,6 +288,8 @@ class VoxelFEMSolverNonlinear:
                 voxels, nu, E_max, E_void, self.constitutive,
                 self.B_gauss_gpu, self.E0_elem_gpu,
                 chunk_size=gpu_chunk_size,
+                smoother=mg_smoother,
+                chebyshev_c_ratio=mg_chebyshev_c_ratio,
             )
         else:
             if verbose:
