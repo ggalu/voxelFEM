@@ -107,7 +107,7 @@ def _iter_bound(kappa, res0, tol):
         return None
     rho   = (kappa ** 0.5 - 1.0) / (kappa ** 0.5 + 1.0)
     ratio = tol / (2.0 * max(res0, 1e-300))
-    if ratio >= 1.0 or rho <= 0.0:
+    if ratio >= 1.0 or rho <= 0.0 or rho >= 1.0:
         return None
     return max(1, int(math.ceil(math.log(ratio) / math.log(rho))))
 

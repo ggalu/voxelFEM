@@ -69,9 +69,11 @@ class NonlinearMultigrid:
 
         self.Nx, self.Ny, self.Nz = voxels.shape
 
-        # Build initial hierarchy from base voxels (before any deformation)
+        # Build initial hierarchy from base voxels (before any deformation).
+        # E_void=0.0 so that void elements (uint8=0) contribute zero stiffness
+        # at every level, consistent with the fine-level solid_mask treatment.
         self._gmg = GeometricMultigrid(
-            voxels, nu, E_max, E_void,
+            voxels, nu, E_max, 0.0,
             n_levels=n_levels, n_pre=n_pre, n_post=n_post, bc_mask=self.bc_mask,
             use_gpu=self.use_gpu, chunk_size=self.chunk_size,
             smoother=self.smoother, chebyshev_c_ratio=self.chebyshev_c_ratio,
@@ -130,7 +132,7 @@ class NonlinearMultigrid:
         cp.get_default_memory_pool().free_all_blocks()
 
         self._gmg = GeometricMultigrid(
-            E_t_voxels, self.nu, self.E_max, self.E_void,
+            E_t_voxels, self.nu, self.E_max, 0.0,
             n_levels=self.n_levels, n_pre=self.n_pre, n_post=self.n_post,
             bc_mask=self.bc_mask,
             use_gpu=self.use_gpu, chunk_size=self.chunk_size,

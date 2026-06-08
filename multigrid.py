@@ -80,12 +80,20 @@ class GridLevel:
                                        self.Ny, self.Nz, self.Ndof,
                                        chunk_size=self.chunk_size)
 
-        diag = xp.where(diag < 1e-12, xp.asarray(1.0, dtype=diag.dtype), diag)
+        # Identify zero-diagonal DOFs before the floor replacement.  These are
+        # nodes adjacent only to void/zero-E elements; they need identity rows
+        # in matvec (same as Dirichlet BCs) so the coarse operator is
+        # non-singular when void regions are present.
+        zero_diag_bool = diag < 1e-12
+        zero_diag_cpu = (cp.asnumpy(zero_diag_bool)
+                         if xp is not np else zero_diag_bool)
+        self._void_dofs_np = np.where(zero_diag_cpu)[0].astype(np.int32)
+
+        diag = xp.where(zero_diag_bool, xp.asarray(1.0, dtype=diag.dtype), diag)
         self.diag_inv = (1.0 / diag).astype(np.float32)
 
-        # Essential (Dirichlet) DOFs for this level; set via set_bc(). Without
-        # BCs the operator is singular (rigid-body modes) and the V-cycle
-        # diverges, so the constrained DOFs are treated as identity rows.
+        # bc_mask holds the union of Dirichlet + void-only DOF indices (identity
+        # rows in matvec); initialised here, extended by set_bc().
         self.bc_mask = None
 
     def set_bc(self, bc_mask):
@@ -97,12 +105,19 @@ class GridLevel:
         them at zero throughout the V-cycle. ``bc_mask`` arrives as a NumPy
         bool array; it is converted to int32 indices and stored on ``xp`` to
         avoid holding a full-Ndof bool per level.
+
+        Void-only DOFs (``_void_dofs_np``, pre-computed in ``__init__``) are
+        always merged into the combined mask so zero-E nodes at coarse levels
+        also receive identity rows.  This keeps the coarse operator consistent
+        with the fine-level solid_mask treatment of void elements.
         """
-        if bc_mask is None:
+        bc_idx = (np.where(bc_mask)[0].astype(np.int32)
+                  if bc_mask is not None else np.empty(0, dtype=np.int32))
+        combined = np.union1d(bc_idx, self._void_dofs_np).astype(np.int32)
+        if len(combined) == 0:
             self.bc_mask = None
             return
-        bc_idx = np.where(bc_mask)[0].astype(np.int32)
-        self.bc_mask = self.xp.asarray(bc_idx)
+        self.bc_mask = self.xp.asarray(combined)
         self.diag_inv = self.diag_inv.copy()
         self.diag_inv[self.bc_mask] = 1.0
 
