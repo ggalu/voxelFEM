@@ -412,7 +412,7 @@ class GeometricMultigrid:
                 break
             v = w / nrm
 
-        return max(lam * 1.1, 1e-10)
+        return max(lam * 1.25, 1e-10)
 
     def _get_lambda_max(self, level):
         """Return cached lambda_max estimate for D⁻¹A on this level."""

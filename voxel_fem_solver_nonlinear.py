@@ -201,9 +201,6 @@ class VoxelFEMSolverNonlinear:
         self.E_void = E_void
         self.is_linear = is_linear
         self.tol_pcg = tol_pcg
-        self.constitutive = constitutive or ConstitutiveModel(
-            "linear", E_void=E_void, E_max=E_max
-        )
         self.n_load_steps = 1 if is_linear else n_load_steps
         self.max_nr_iter = max_nr_iter
         self.tol_nr = tol_nr
@@ -238,6 +235,9 @@ class VoxelFEMSolverNonlinear:
             E0_cpu = voxels.ravel().astype(np.float32) * E_scale + E_void
 
         self.E_max = E_max
+        self.constitutive = constitutive or ConstitutiveModel(
+            "linear", E_void=E_void, E_max=E_max
+        )
         self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float32)
 
         # Solid/void mask (Stage 1: binary void elimination).
