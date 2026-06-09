@@ -61,6 +61,7 @@ python measure_vram.py 100 200 --preconditioner jacobi
 python crop_numpy_array.py input.npz output.npz 40 40 40                    # centered crop
 python crop_numpy_array.py input.npz output.npz 40 40 40 --offset 5 10 -3   # offset crop
 python crop_numpy_array.py input.npz output.npz 60 50 40 --offset 0 5 0     # offset only Y
+python3 crop_numpy_array.py ~/Archiv/seg_unload_post.npz free_surface.npz 50 370 370 --offset 0 -25 0
 ```
 
 **After every change to a `.py` file, run the test suite before proceeding.**
