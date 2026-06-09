@@ -2,10 +2,11 @@
   <ServerManagerState version="5.11.2">
     <Proxy group="animation" type="AnimationScene" id="261" servers="16">
       <Property name="AnimationTime" id="261.AnimationTime" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="1"/>
       </Property>
-      <Property name="Cues" id="261.Cues" number_of_elements="1">
+      <Property name="Cues" id="261.Cues" number_of_elements="2">
         <Proxy value="263"/>
+        <Proxy value="8665"/>
         <Domain name="groups" id="261.Cues.groups"/>
       </Property>
       <Property name="Duration" id="261.Duration" number_of_elements="1">
@@ -35,7 +36,7 @@
         <Domain name="bool" id="261.Loop.bool"/>
       </Property>
       <Property name="NumberOfFrames" id="261.NumberOfFrames" number_of_elements="1">
-        <Element index="0" value="10"/>
+        <Element index="0" value="50"/>
         <Domain name="range" id="261.NumberOfFrames.range"/>
       </Property>
       <Property name="Play" id="261.Play"/>
@@ -62,6 +63,116 @@
       <Property name="ViewModules" id="261.ViewModules" number_of_elements="1">
         <Proxy value="4888"/>
         <Domain name="groups" id="261.ViewModules.groups"/>
+      </Property>
+    </Proxy>
+    <Proxy group="animation_keyframes" type="CompositeKeyFrame" id="8666" servers="16">
+      <Property name="Base" id="8666.Base" number_of_elements="1">
+        <Element index="0" value="2"/>
+      </Property>
+      <Property name="EndPower" id="8666.EndPower" number_of_elements="1">
+        <Element index="0" value="1"/>
+      </Property>
+      <Property name="Frequency" id="8666.Frequency" number_of_elements="1">
+        <Element index="0" value="1"/>
+      </Property>
+      <Property name="KeyTime" id="8666.KeyTime" number_of_elements="1">
+        <Element index="0" value="0"/>
+        <Domain name="range" id="8666.KeyTime.range"/>
+      </Property>
+      <Property name="KeyValues" id="8666.KeyValues" number_of_elements="1">
+        <Element index="0" value="-25"/>
+      </Property>
+      <Property name="Offset" id="8666.Offset" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="Phase" id="8666.Phase" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="StartPower" id="8666.StartPower" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="Type" id="8666.Type" number_of_elements="1">
+        <Element index="0" value="2"/>
+        <Domain name="enum" id="8666.Type.enum">
+          <Entry value="1" text="Boolean"/>
+          <Entry value="2" text="Ramp"/>
+          <Entry value="3" text="Exponential"/>
+          <Entry value="4" text="Sinusoid"/>
+        </Domain>
+      </Property>
+    </Proxy>
+    <Proxy group="animation_keyframes" type="CompositeKeyFrame" id="8667" servers="16">
+      <Property name="Base" id="8667.Base" number_of_elements="1">
+        <Element index="0" value="2"/>
+      </Property>
+      <Property name="EndPower" id="8667.EndPower" number_of_elements="1">
+        <Element index="0" value="1"/>
+      </Property>
+      <Property name="Frequency" id="8667.Frequency" number_of_elements="1">
+        <Element index="0" value="1"/>
+      </Property>
+      <Property name="KeyTime" id="8667.KeyTime" number_of_elements="1">
+        <Element index="0" value="1"/>
+        <Domain name="range" id="8667.KeyTime.range"/>
+      </Property>
+      <Property name="KeyValues" id="8667.KeyValues" number_of_elements="1">
+        <Element index="0" value="25"/>
+      </Property>
+      <Property name="Offset" id="8667.Offset" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="Phase" id="8667.Phase" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="StartPower" id="8667.StartPower" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="Type" id="8667.Type" number_of_elements="1">
+        <Element index="0" value="2"/>
+        <Domain name="enum" id="8667.Type.enum">
+          <Entry value="1" text="Boolean"/>
+          <Entry value="2" text="Ramp"/>
+          <Entry value="3" text="Exponential"/>
+          <Entry value="4" text="Sinusoid"/>
+        </Domain>
+      </Property>
+    </Proxy>
+    <Proxy group="animation" type="KeyFrameAnimationCue" id="8665" servers="16">
+      <Property name="AnimatedDomainName" id="8665.AnimatedDomainName" number_of_elements="1">
+        <Element index="0" value=""/>
+      </Property>
+      <Property name="AnimatedElement" id="8665.AnimatedElement" number_of_elements="1">
+        <Element index="0" value="-1"/>
+      </Property>
+      <Property name="AnimatedPropertyName" id="8665.AnimatedPropertyName" number_of_elements="1">
+        <Element index="0" value="ContourValues"/>
+      </Property>
+      <Property name="AnimatedProxy" id="8665.AnimatedProxy" number_of_elements="1">
+        <Proxy value="8400"/>
+        <Domain name="groups" id="8665.AnimatedProxy.groups"/>
+      </Property>
+      <Property name="Enabled" id="8665.Enabled" number_of_elements="1">
+        <Element index="0" value="1"/>
+        <Domain name="bool" id="8665.Enabled.bool"/>
+      </Property>
+      <Property name="EndTime" id="8665.EndTime" number_of_elements="1">
+        <Element index="0" value="1"/>
+      </Property>
+      <Property name="KeyFrames" id="8665.KeyFrames" number_of_elements="2">
+        <Proxy value="8666"/>
+        <Proxy value="8667"/>
+        <Domain name="groups" id="8665.KeyFrames.groups"/>
+      </Property>
+      <Property name="LastAddedKeyFrameIndex" id="8665.LastAddedKeyFrameIndex"/>
+      <Property name="StartTime" id="8665.StartTime" number_of_elements="1">
+        <Element index="0" value="0"/>
+      </Property>
+      <Property name="TimeMode" id="8665.TimeMode" number_of_elements="1">
+        <Element index="0" value="0"/>
+        <Domain name="enum" id="8665.TimeMode.enum">
+          <Entry value="0" text="Normalized"/>
+          <Entry value="1" text="Relative"/>
+        </Domain>
       </Property>
     </Proxy>
     <Proxy group="animation" type="TimeAnimationCue" id="263" servers="16">
@@ -4034,9 +4145,9 @@
         <Element index="0" value="0"/>
       </Property>
       <Property name="Origin" id="8394.Origin" number_of_elements="3">
-        <Element index="0" value="45"/>
-        <Element index="1" value="175"/>
-        <Element index="2" value="175"/>
+        <Element index="0" value="25"/>
+        <Element index="1" value="185"/>
+        <Element index="2" value="185"/>
         <Domain name="range" id="8394.Origin.range"/>
       </Property>
     </Proxy>
@@ -6148,7 +6259,7 @@
         </Domain>
       </Property>
       <Property name="Representation" id="7738.Representation" number_of_elements="1">
-        <Element index="0" value="Surface"/>
+        <Element index="0" value="Outline"/>
         <Domain name="list" id="7738.Representation.list">
           <String text="3D Glyphs"/>
           <String text="Feature Edges"/>
@@ -6200,7 +6311,7 @@
         <Domain name="bool" id="7738.SelectionVisibility.bool"/>
       </Property>
       <Property name="Visibility" id="7738.Visibility" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="1"/>
         <Domain name="bool" id="7738.Visibility.bool"/>
       </Property>
       <Property name="Ambient" id="7738.Ambient" number_of_elements="1">
@@ -9070,10 +9181,10 @@
         <Element index="0" value="%-#6.1e"/>
       </Property>
       <Property name="DataRangeMax" id="8084.DataRangeMax" number_of_elements="1">
-        <Element index="0" value="0.06632206296982324"/>
+        <Element index="0" value="0.08614377213085156"/>
       </Property>
       <Property name="DataRangeMin" id="8084.DataRangeMin" number_of_elements="1">
-        <Element index="0" value="0.0006448462498834167"/>
+        <Element index="0" value="0.0004229868261680605"/>
       </Property>
       <Property name="DrawAnnotations" id="8084.DrawAnnotations" number_of_elements="1">
         <Element index="0" value="1"/>
@@ -9619,10 +9730,10 @@
         <Element index="0" value="%-#6.1e"/>
       </Property>
       <Property name="DataRangeMax" id="8113.DataRangeMax" number_of_elements="1">
-        <Element index="0" value="NaN"/>
+        <Element index="0" value="255"/>
       </Property>
       <Property name="DataRangeMin" id="8113.DataRangeMin" number_of_elements="1">
-        <Element index="0" value="NaN"/>
+        <Element index="0" value="0"/>
       </Property>
       <Property name="DrawAnnotations" id="8113.DrawAnnotations" number_of_elements="1">
         <Element index="0" value="1"/>
@@ -9820,7 +9931,7 @@
         <Domain name="bool" id="8113.UseCustomLabels.bool"/>
       </Property>
       <Property name="Visibility" id="8113.Visibility" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="1"/>
         <Domain name="bool" id="8113.Visibility.bool"/>
       </Property>
       <Property name="WindowLocation" id="8113.WindowLocation" number_of_elements="1">
@@ -10182,7 +10293,7 @@
     </Proxy>
     <Proxy group="filters" type="Cut" id="8400" servers="1">
       <Property name="ContourValues" id="8400.ContourValues" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="25"/>
         <Domain name="bounds" id="8400.ContourValues.bounds"/>
       </Property>
       <Property name="CutFunction" id="8400.CutFunction" number_of_elements="1">
@@ -10341,7 +10452,7 @@
     <Proxy group="misc" type="TimeKeeper" id="256" servers="16">
       <Property name="SuppressedTimeSources" id="256.SuppressedTimeSources"/>
       <Property name="Time" id="256.Time" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="1"/>
         <Domain name="range" id="256.Time.range"/>
       </Property>
       <Property name="TimeLabel" id="256.TimeLabel" number_of_elements="1">
@@ -11074,10 +11185,10 @@
       </Property>
       <Property name="ViewSize" id="4888.ViewSize" number_of_elements="2">
         <Element index="0" value="1340"/>
-        <Element index="1" value="782"/>
+        <Element index="1" value="532"/>
       </Property>
       <Property name="ViewTime" id="4888.ViewTime" number_of_elements="1">
-        <Element index="0" value="0"/>
+        <Element index="0" value="1"/>
         <Domain name="range" id="4888.ViewTime.range"/>
       </Property>
       <Property name="VolumeAnisotropy" id="4888.VolumeAnisotropy" number_of_elements="1">
@@ -11099,14 +11210,14 @@
         <Element index="0" value="0"/>
       </Property>
       <Property name="CameraFocalPoint" id="4888.CameraFocalPoint" number_of_elements="3">
-        <Element index="0" value="19.464083230657813"/>
-        <Element index="1" value="105.74645852428934"/>
-        <Element index="2" value="172.08070572497093"/>
+        <Element index="0" value="48.55584904477253"/>
+        <Element index="1" value="183.85685522390358"/>
+        <Element index="2" value="166.21226070475618"/>
       </Property>
       <Property name="CameraFocalPointInfo" id="4888.CameraFocalPointInfo" number_of_elements="3">
-        <Element index="0" value="19.464083230657813"/>
-        <Element index="1" value="105.74645852428934"/>
-        <Element index="2" value="172.08070572497093"/>
+        <Element index="0" value="48.55584904477253"/>
+        <Element index="1" value="183.85685522390358"/>
+        <Element index="2" value="166.21226070475618"/>
       </Property>
       <Property name="CameraParallelScale" id="4888.CameraParallelScale" number_of_elements="1">
         <Element index="0" value="298.496231131986"/>
@@ -11115,14 +11226,14 @@
         <Element index="0" value="298.496231131986"/>
       </Property>
       <Property name="CameraPosition" id="4888.CameraPosition" number_of_elements="3">
-        <Element index="0" value="800.7188880424247"/>
-        <Element index="1" value="40.0763806096363"/>
-        <Element index="2" value="248.44295923095217"/>
+        <Element index="0" value="727.6949166670857"/>
+        <Element index="1" value="132.16587620732798"/>
+        <Element index="2" value="-229.51617200220127"/>
       </Property>
       <Property name="CameraPositionInfo" id="4888.CameraPositionInfo" number_of_elements="3">
-        <Element index="0" value="800.7188880424247"/>
-        <Element index="1" value="40.0763806096363"/>
-        <Element index="2" value="248.44295923095217"/>
+        <Element index="0" value="727.6949166670857"/>
+        <Element index="1" value="132.16587620732798"/>
+        <Element index="2" value="-229.51617200220127"/>
       </Property>
       <Property name="CameraViewAngle" id="4888.CameraViewAngle" number_of_elements="1">
         <Element index="0" value="30"/>
@@ -11131,14 +11242,14 @@
         <Element index="0" value="30"/>
       </Property>
       <Property name="CameraViewUp" id="4888.CameraViewUp" number_of_elements="3">
-        <Element index="0" value="-0.09673204946380015"/>
-        <Element index="1" value="0.006549794229789132"/>
-        <Element index="2" value="0.9952889082081045"/>
+        <Element index="0" value="0.46518431701815727"/>
+        <Element index="1" value="-0.29030428824570614"/>
+        <Element index="2" value="0.8362577183060881"/>
       </Property>
       <Property name="CameraViewUpInfo" id="4888.CameraViewUpInfo" number_of_elements="3">
-        <Element index="0" value="-0.09673204946380015"/>
-        <Element index="1" value="0.006549794229789132"/>
-        <Element index="2" value="0.9952889082081045"/>
+        <Element index="0" value="0.46518431701815727"/>
+        <Element index="1" value="-0.29030428824570614"/>
+        <Element index="2" value="0.8362577183060881"/>
       </Property>
       <Property name="EyeAngle" id="4888.EyeAngle" number_of_elements="1">
         <Element index="0" value="2"/>
@@ -11147,6 +11258,9 @@
     </Proxy>
     <ProxyCollection name="animation">
       <Item id="261" name="AnimationScene1"/>
+      <Item id="8666" name="KeyFrame8666"/>
+      <Item id="8667" name="KeyFrame8667"/>
+      <Item id="8665" name="KeyFrameAnimationCue1"/>
       <Item id="263" name="TimeAnimationCue1"/>
     </ProxyCollection>
     <ProxyCollection name="layouts">
