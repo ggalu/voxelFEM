@@ -69,10 +69,8 @@ class GridLevel:
                                   self.K_ref, self.Ndof)
         else:
             # ----- GPU path: implicit connectivity, no conn_dof stored -----
-            # E_elem stored as float16 (halves the 1.2 GB fine-level footprint
-            # at 300M voxels; matvec ops upcast to float32 automatically).
             from kernels_cupy_nl import build_diagonal_cupy
-            self.E_elem = xp.asarray(E_elem_cpu, dtype=xp.float16)
+            self.E_elem = xp.asarray(E_elem_cpu, dtype=xp.float32)
             self.K_ref = xp.asarray(K_ref_cpu.astype(np.float32))
             self.conn_dof = None
             diag_ref = xp.asarray(np.diag(K_ref_cpu).astype(np.float32))

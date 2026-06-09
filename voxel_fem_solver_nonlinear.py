@@ -26,7 +26,7 @@ Constitutive models (via ConstitutiveModel):
   hardening : E_t = E0 · (1 + beta · eps_vm^n)
 
 GPU memory (300M elements, 48 GB VRAM):
-  E0_elem (float16):                  0.6 GB
+  E0_elem (float32):                  1.2 GB
   u, x/Δu, p, r, z (float32):       21.6 GB   (6 arrays × 3.6 GB)
   f_int/R, Ap (float32):             7.2 GB   (2 arrays × 3.6 GB)
   MG fine diagonal (float32):        3.6 GB
@@ -238,7 +238,7 @@ class VoxelFEMSolverNonlinear:
             E0_cpu = voxels.ravel().astype(np.float32) * E_scale + E_void
 
         self.E_max = E_max
-        self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float16)
+        self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float32)
 
         # Solid/void mask (Stage 1: binary void elimination).
         # solid_elem_gpu : (Ne,) bool CuPy — True for load-bearing elements.
