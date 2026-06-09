@@ -55,6 +55,12 @@ python example_layered.py --size 48 --contrast 100 --format vtk
 python measure_vram.py                          # all three benchmark sizes
 python measure_vram.py 200                      # single size
 python measure_vram.py 100 200 --preconditioner jacobi
+
+# Crop .npz volumetric data (for testing / analysis)
+# Crops to a centered region, with optional 3D offset; displays central slices (X, Y, Z)
+python crop_numpy_array.py input.npz output.npz 40 40 40                    # centered crop
+python crop_numpy_array.py input.npz output.npz 40 40 40 --offset 5 10 -3   # offset crop
+python crop_numpy_array.py input.npz output.npz 60 50 40 --offset 0 5 0     # offset only Y
 ```
 
 **After every change to a `.py` file, run the test suite before proceeding.**
@@ -691,3 +697,43 @@ defects had to be fixed:
 
 The Python triple-for-loops in `_coarsen_image`, `_restrict`, `_prolongate` were
 also replaced with vectorised NumPy (`reduceat` / `einsum`).
+
+## Utility tools
+
+### `crop_numpy_array.py` — volumetric data cropping and visualization
+
+**Purpose**: Crop 3D volumetric datasets (stored as `.npz` archives) to a specified
+region, optionally offset from center. Displays orthogonal central slices (X, Y, Z)
+for quick visual inspection.
+
+**Input**: `.npz` file containing one or more 3D arrays (all must be same shape).
+
+**Output**: Cropped `.npz` file + matplotlib figure with three central slices.
+
+**Usage**:
+```bash
+# Centered crop to 40×40×40
+python crop_numpy_array.py input.npz output.npz 40 40 40
+
+# Centered crop with 3D offset (shift 5 in X, 10 in Y, -3 in Z)
+python crop_numpy_array.py input.npz output.npz 40 40 40 --offset 5 10 -3
+
+# Offset only in Y direction
+python crop_numpy_array.py input.npz output.npz 60 50 40 --offset 0 5 0
+```
+
+**Arguments**:
+- `input` — Input `.npz` file
+- `output` — Output `.npz` file
+- `Nx`, `Ny`, `Nz` — Crop dimensions
+- `--offset OX OY OZ` — 3D offset from center (default: 0 0 0 for centered crop)
+
+**Visualization**: After saving, displays a 3×1 matplotlib figure showing central
+slices perpendicular to X, Y, and Z axes. Each slice includes:
+- Central slice index in the title
+- Grayscale colormap of label values
+- Individual colorbar
+- Proper axis labels
+
+**Example use case**: Reduce a large volumetric CT scan (`exp_data.npz`) to a 50³
+test region with controlled offset to sample a specific anatomical feature.

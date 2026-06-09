@@ -55,15 +55,11 @@ from kernels_cupy_nl import compute_f_int_cupy, build_B_gauss
 # ---------------------------------------------------------------------------
 # Label -> Young's modulus mapping  (edit here to change material properties)
 # ---------------------------------------------------------------------------
-#   label 0   : void / background  → removed from system (solid_mask = False)
-#   label 1   : matrix             [GPa]
-#   label 2   : fibres             [GPa]
-#   label 255 : air                → removed from system (solid_mask = False)
 LABEL_MODULI = {
-    0:   1.0e-3,    # void  (near-zero; excluded via solid_mask)
-    1:   1.0,       # matrix  [GPa]
-    2:   10.0,      # fibres  [GPa]
-    255: 1.0e-3,    # air   (near-zero; excluded via solid_mask)
+    0:    1.0e-6,   # void  (near-zero; excluded via solid_mask)
+    1:    1.8e0,    # matrix (PA66) [GPa]
+    2:   72.0e0,    # fibres (glass fibres)  [GPa]
+    255:  1.0e-6,   # air   (near-zero; excluded via solid_mask)
 }
 
 # Labels treated as void/air: removed from the FEM system via solid_mask.
