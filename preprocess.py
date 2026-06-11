@@ -52,7 +52,6 @@ def main():
     bins = int(params.get('bins', 256))
     exclude_labels = params.get('exclude_labels', [0, 255])
     output = params.get('output')
-    text_output = params.get('text_output')
     E_matrix = float(params.get('E_matrix', 1.8))
     E_fibre = float(params.get('E_fibre', 72.0))
     fibre_fraction = float(params.get('fibre_fraction', 0.30))
@@ -169,25 +168,25 @@ def main():
     else:
         plt.show()
 
-    # Save histogram data to text file
-    if text_output:
-        with open(text_output, 'w') as f:
-            f.write("# Grey Level Histogram and Young's Modulus Mapping\n")
-            f.write(f"# Total voxels: {n_total:,}\n")
-            f.write(f"# Included voxels: {n_included:,}\n")
-            f.write(f"# Excluded labels: {exclude_labels}\n")
-            f.write(f"# Statistics: mean={intensities_filtered.mean():.2f}, std={intensities_filtered.std():.2f}, median={np.median(intensities_filtered):.2f}\n")
-            f.write(f"# \n")
-            f.write(f"# Modulus Mapping Parameters:\n")
-            f.write(f"# E_matrix={E_matrix} GPa, E_fibre={E_fibre} GPa\n")
-            f.write(f"# Fibre volume fraction (target)={fibre_fraction:.1%}, (realised)={mmap.realised_fibre_fraction():.1%}\n")
-            f.write(f"# Mixing rule={mmap.mixing}, exponent={mmap.exponent}\n")
-            f.write(f"# Matrix grey={mmap.g_matrix:.1f}, Fibre grey={mmap.g_fibre:.1f}\n")
-            f.write("# \n")
-            f.write("bin_center\tcount\tfibre_fraction\tYoungs_modulus_GPa\n")
-            for center, count, phi, E in zip(mmap.bin_centers, mmap.counts, mmap.phi, mmap.E):
-                f.write(f"{center:.1f}\t{count}\t{phi:.4f}\t{E:.4f}\n")
-        print(f"Histogram data saved to '{text_output}'")
+    # Save histogram data with intensity-to-modulus mapping
+    histogram_file = 'histogram_modulus.txt'
+    with open(histogram_file, 'w') as f:
+        f.write("# Grey Level Histogram and Young's Modulus Mapping\n")
+        f.write(f"# Total voxels: {n_total:,}\n")
+        f.write(f"# Included voxels: {n_included:,}\n")
+        f.write(f"# Excluded labels: {exclude_labels}\n")
+        f.write(f"# Statistics: mean={intensities_filtered.mean():.2f}, std={intensities_filtered.std():.2f}, median={np.median(intensities_filtered):.2f}\n")
+        f.write(f"# \n")
+        f.write(f"# Modulus Mapping Parameters:\n")
+        f.write(f"# E_matrix={E_matrix} GPa, E_fibre={E_fibre} GPa\n")
+        f.write(f"# Fibre volume fraction (target)={fibre_fraction:.1%}, (realised)={mmap.realised_fibre_fraction():.1%}\n")
+        f.write(f"# Mixing rule={mmap.mixing}, exponent={mmap.exponent}\n")
+        f.write(f"# Matrix grey={mmap.g_matrix:.1f}, Fibre grey={mmap.g_fibre:.1f}\n")
+        f.write("# \n")
+        f.write("intensity_bin_center\tvoxel_count\tfibre_fraction\tYoungs_modulus_GPa\n")
+        for center, count, phi, E in zip(mmap.bin_centers, mmap.counts, mmap.phi, mmap.E):
+            f.write(f"{center:.1f}\t{count}\t{phi:.4f}\t{E:.4f}\n")
+    print(f"Histogram and modulus mapping saved to '{histogram_file}'")
 
     # Create per-voxel Young's modulus array and save to .npz
     E_per_voxel = np.zeros_like(intensity, dtype=np.float32)
