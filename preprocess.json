@@ -1,0 +1,13 @@
+{
+  "label_key": "labels",
+  "intensity_key": "intensity",
+  "bins": 256,
+  "exclude_labels": [0, 255],
+  "output": null,
+  "text_output": null,
+  "E_matrix": 1.8,
+  "E_fibre": 72.0,
+  "fibre_fraction": 0.30,
+  "exponent": 1.0,
+  "mixing": "geometric"
+}
