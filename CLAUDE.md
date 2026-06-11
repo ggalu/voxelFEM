@@ -701,6 +701,173 @@ also replaced with vectorised NumPy (`reduceat` / `einsum`).
 
 ## Utility tools
 
+### CT data simulation pipeline: `preprocess.py` → `simulateCT.py`
+
+**Purpose**: Complete workflow to convert CT scan data (with segmentation labels) into 
+FEM results with effective mechanical properties. Two-stage pipeline: (1) compute 
+voxel-wise Young's modulus from grey levels using a fiber-matrix mixing model; 
+(2) run linear-elastic FEM under uniaxial tension, compute effective modulus, and 
+export stress/strain fields.
+
+**Input**: `.npz` file with keys `labels` (uint8 segmentation) and `intensity` 
+(grey levels); shape must match. Void (label 0) and air (label 255) are 
+automatically excluded from the FEM system.
+
+**Output**: 
+- Stage 1: Updated `.npz` with new key `Young_modulus` (float32), plus 
+  `histogram_modulus.txt` (tabular mapping) and optional PNG plot.
+- Stage 2: `.vti` output with per-voxel stress, strain, and Young's modulus fields 
+  for ParaView visualization.
+
+#### Stage 1: `preprocess.py` — Grey level → Young's modulus mapping
+
+Loads intensity histogram from CT data (optionally excluding specific labels), 
+estimates a fiber-matrix mixing model, and creates a per-voxel Young's modulus field.
+
+**Configuration** (default: `preprocess.json`):
+```json
+{
+  "input": "exp_data.npz",
+  "label_key": "labels",
+  "intensity_key": "intensity",
+  "bins": 256,
+  "exclude_labels": [0, 255],
+  "output": "histogram_plot.png",
+  "E_matrix": 1.8,
+  "E_fibre": 72.0,
+  "fibre_fraction": 0.30,
+  "mixing": "geometric",
+  "exponent": 1.0
+}
+```
+
+**Parameters**:
+- `input` — Path to `.npz` file (required)
+- `label_key`, `intensity_key` — Array keys in `.npz`
+- `bins` — Histogram bin count (default: 256)
+- `exclude_labels` — Label values to skip (default: `[0, 255]` for void/air)
+- `output` — Optional PNG plot filename
+- `E_matrix`, `E_fibre` — Reference moduli (GPa)
+- `fibre_fraction` — Target fiber volume fraction (0–1)
+- `mixing` — Rule: `"geometric"` (power-law), `"voigt"` (stiff upper bound), 
+  or `"reuss"` (compliant lower bound)
+- `exponent` — Exponent for geometric mixing (typically 0.5–2.0)
+
+**Usage**:
+```bash
+# With default preprocess.json
+python preprocess.py
+
+# With custom config
+python preprocess.py --config my_config.json
+```
+
+**Output files**:
+- `exp_data.npz` — Updated in-place with new `Young_modulus` array
+- `histogram_modulus.txt` — Tabular format: intensity bin center, voxel count, 
+  fiber fraction, Young's modulus
+- `histogram_plot.png` — (if `output` set) Two-panel figure: grey-level histogram 
+  + Young's modulus vs. intensity curve with phase endpoints marked
+
+**Physics**: The pipeline maps each intensity value `g` to a fiber volume fraction 
+`φ(g)`, then applies a mixing rule to get Young's modulus:
+- **Geometric (power-law, default)**: `E(g) = E_matrix · (E_fibre / E_matrix)^(p·φ(g))`
+- **Voigt (stiff bound)**: `E(g) = E_matrix + φ(g) · (E_fibre − E_matrix)`
+- **Reuss (compliant bound)**: `E(g) = 1 / (φ(g)/E_fibre + (1−φ(g))/E_matrix)`
+
+#### Stage 2: `simulateCT.py` — Linear-elastic FEM on CT data
+
+Loads the preprocessed `.npz` with `Young_modulus` field and runs a single 
+linear-elastic solve under 1% uniaxial tensile strain. Computes effective modulus 
+from reaction forces on the loaded end-face and exports per-voxel stress/strain 
+to VTI (ParaView format).
+
+**Configuration** (default: `simulateCT.json`):
+```json
+{
+  "data": "free_surface.npz",
+  "axis": "z",
+  "strain": 0.01,
+  "nu": 0.3,
+  "maxiter": 100,
+  "preconditioner": "multigrid",
+  "smoother": "chebyshev",
+  "vtk": "ct_result"
+}
+```
+
+**Parameters**:
+- `data` — Path to preprocessed `.npz` file (must have `labels` and `Young_modulus`)
+- `axis` — Loading direction: `"x"`, `"y"`, or `"z"` (default: `"z"`)
+- `strain` — Uniaxial strain magnitude (default: 0.01 = 1%)
+- `nu` — Poisson ratio (default: 0.3)
+- `maxiter` — Max PCG iterations (default: 100)
+- `preconditioner` — `"jacobi"` or `"multigrid"` (default: `"multigrid"`)
+- `smoother` — For multigrid: `"jacobi"` or `"chebyshev"` (default: `"chebyshev"`)
+- `vtk` — VTI output prefix (set to `""` or `null` to disable)
+
+**Usage**:
+```bash
+# With default simulateCT.json
+python simulateCT.py
+
+# With custom config
+# (edit simulateCT.json and run)
+```
+
+**Boundary conditions**:
+- **Two end-faces** along the loading axis are prescribed displacement (uniaxial tension)
+- **Four lateral faces** remain traction-free, allowing Poisson contraction
+- **3-2-1 anchor**: Three minimal constraints (two transverse DOFs at origin, 
+  one at a corner) remove rigid-body motion without restraining lateral faces
+
+**Affine initialization**: The displacement field is seeded with the exact 
+homogeneous solution (`u_axis = ε·x_axis`, `u_transverse = −ν·ε·x_transverse`) 
+before PCG starts. This is the exact solution for uniform material and typically 
+halves PCG iterations for heterogeneous media.
+
+**Void/air elimination**: Labels 0 (void) and 255 (air) are identified via the 
+`labels` array and **removed from the system** using a binary solid mask. Void 
+nodes receive identity rows (no stiffness), so the DOF vector stays full-grid 
+length and inactive DOFs remain exactly zero. Only labels 1 (matrix) and 2 
+(fiber) carry load.
+
+**Output**:
+- **Console report**: Grid dimensions, voxel counts, modulus range, applied strain, 
+  solve time, displacement ranges per axis, reaction force, effective modulus
+- **Floating-island diagnostic**: Identifies solid components with no Dirichlet BC 
+  contact (decoupled and held at zero by the void mask)
+- **`.vti` file** (if enabled): Per-voxel fields at cell centers—
+  - `youngs_modulus` — Modulus from file
+  - `effective_strain` — von Mises strain
+  - `effective_stress` — von Mises stress
+  - `Exx, Eyy, Ezz, Exy, Eyz, Exz` — Strain tensor (engineering shear γ)
+  - `Sxx, Syy, Szz, Sxy, Syz, Sxz` — Stress tensor
+  - `solid_mask` — Binary solid phase (1 = solid, 0 = void)
+
+**Effective modulus formula**:
+```
+E_eff = (F_reaction / A) / strain
+```
+where `F_reaction` is the summed reaction force on the far end-face, and `A` is 
+the cross-sectional area perpendicular to the loading axis.
+
+#### Example workflow
+
+```bash
+# 1. Preprocess: CT intensity → Young's modulus
+python preprocess.py --config preprocess.json
+# Output: exp_data.npz (updated with Young_modulus), histogram_plot.png, histogram_modulus.txt
+
+# 2. Simulate: FEM under uniaxial tension
+python simulateCT.py
+# Output: ct_result.vti, console report with E_eff
+
+# 3. Visualize in ParaView
+# File → Open: ct_result.vti
+# Representation: Color by "effective_stress" or "youngs_modulus"
+```
+
 ### `crop_numpy_array.py` — volumetric data cropping and visualization
 
 **Purpose**: Crop 3D volumetric datasets (stored as `.npz` archives) to a specified
