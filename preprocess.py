@@ -37,9 +37,8 @@ def load_parameters(config_file):
 def main():
     parser = argparse.ArgumentParser(
         description="Compute grey level histogram from CT scan, excluding voids (label 0, 255). "
-                    "Parameters are read from preprocess.json."
+                    "All parameters are read from configuration file (default: preprocess.json)."
     )
-    parser.add_argument("input", help="Input .npz file")
     parser.add_argument("--config", default="preprocess.json", help="Parameter configuration file (default: preprocess.json)")
     args = parser.parse_args()
 
@@ -47,6 +46,10 @@ def main():
     params = load_parameters(args.config)
 
     # Extract parameters with type conversions
+    input_file = params.get('input')
+    if not input_file:
+        print("Error: 'input' parameter not set in configuration file", file=sys.stderr)
+        sys.exit(1)
     label_key = params.get('label_key', 'labels')
     intensity_key = params.get('intensity_key', 'intensity')
     bins = int(params.get('bins', 256))
@@ -59,7 +62,7 @@ def main():
     mixing = params.get('mixing', 'geometric')
 
     # Load data
-    data = load_npz(args.input)
+    data = load_npz(input_file)
     print(f"Available arrays: {list(data.files)}")
 
     # Get label and intensity arrays
@@ -80,7 +83,7 @@ def main():
         print(f"Error: shape mismatch: labels {labels.shape} != intensity {intensity.shape}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"Loaded arrays:")
+    print(f"Loaded '{input_file}':")
     print(f"  labels: shape {labels.shape}, dtype {labels.dtype}, min {labels.min()}, max {labels.max()}")
     print(f"  intensity: shape {intensity.shape}, dtype {intensity.dtype}, min {intensity.min()}, max {intensity.max()}")
 
@@ -205,11 +208,11 @@ def main():
 
     # Warn if overwriting existing Young_modulus
     if 'Young_modulus' in data.files:
-        print(f"\n⚠ WARNING: Overwriting existing 'Young_modulus' array in '{args.input}'", file=sys.stderr)
+        print(f"\n⚠ WARNING: Overwriting existing 'Young_modulus' array in '{input_file}'", file=sys.stderr)
 
     data_dict['Young_modulus'] = E_per_voxel
-    np.savez(args.input, **data_dict)
-    print(f"Young's modulus array appended to '{args.input}' with key 'Young_modulus'")
+    np.savez(input_file, **data_dict)
+    print(f"Young's modulus array appended to '{input_file}' with key 'Young_modulus'")
 
     # Print analytic mapping formula and parameters
     print(f"\n{'='*70}")

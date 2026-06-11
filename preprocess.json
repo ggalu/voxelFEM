@@ -1,12 +1,34 @@
 {
+  "input": "assets/PA66GF30.npz",
+  "_input_doc": "Path to input .npz file containing CT scan data with label and intensity arrays",
+
   "label_key": "labels",
+  "_label_key_doc": "Array key in .npz file that contains material labels (used to exclude voids/air)",
+
   "intensity_key": "intensity",
+  "_intensity_key_doc": "Array key in .npz file that contains grey-level intensities for modulus mapping",
+
   "bins": 256,
+  "_bins_doc": "Number of histogram bins for discretising intensity levels (default: 256)",
+
   "exclude_labels": [0, 255],
+  "_exclude_labels_doc": "List of label values to exclude (e.g., [0, 255] excludes void and air). Set to [] to include all labels",
+
   "output": null,
+  "_output_doc": "Path to save histogram plot image (PNG). Set to null to display on screen instead",
+
   "E_matrix": 1.8,
+  "_E_matrix_doc": "Young's modulus of matrix phase (GPa). Example: 1.8 for PA66 polymer matrix",
+
   "E_fibre": 72.0,
+  "_E_fibre_doc": "Young's modulus of fibre phase (GPa). Example: 72.0 for glass fibres",
+
   "fibre_fraction": 0.30,
+  "_fibre_fraction_doc": "Target fibre volume fraction (0.0–1.0). Example: 0.30 for 30% glass-fibre-reinforced composite",
+
   "exponent": 1.0,
-  "mixing": "geometric"
+  "_exponent_doc": "Exponent for geometric (power-law) mixing rule. Only used when mixing='geometric'. Typical range: 0.5–2.0",
+
+  "mixing": "geometric",
+  "_mixing_doc": "Mixing rule for composite Young's modulus. Options: 'geometric' (power-law, default), 'voigt' (stiff bound), 'reuss' (compliant bound)"
 }
