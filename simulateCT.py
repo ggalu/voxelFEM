@@ -5,10 +5,10 @@
 """
 Voxel FEM simulation of a CT-segmented sample
 ==============================================
-Loads ``exp_data.npz`` (keys: ``labels``, ``intensity``; shape 100×600×600),
-uses the ``labels`` array directly as Young's moduli (label value = E in GPa),
-and runs a single **linear-elastic** solve under 1% uniaxial tensile strain.
-Default loading axis is **z** (length 100).
+Loads ``free_surface.npz`` (keys: ``labels``, ``youngs_modulus``; shape N×M×K),
+where Young's modulus has been precomputed for each voxel, and runs a single
+**linear-elastic** solve under 1% uniaxial tensile strain. Default loading axis
+is **z**.
 
 Affine initialisation
 ---------------------
@@ -36,13 +36,25 @@ cube the domain length equals N_axis, so Δ = ε·N_axis.
 
 Usage
 -----
+Edit the parameters in ``simulateCT.json``, then run:
+
     python simulateCT.py
-    python simulateCT.py --axis z --strain 0.01 --maxiter 200
-    python simulateCT.py --preconditioner multigrid --smoother chebyshev
-    python simulateCT.py --vtk ct_result --axis x
+
+Example ``simulateCT.json``:
+
+    {
+      "data": "free_surface.npz",
+      "axis": "x",
+      "strain": 0.01,
+      "nu": 0.3,
+      "maxiter": 100,
+      "preconditioner": "multigrid",
+      "smoother": "chebyshev",
+      "vtk": "ct_result"
+    }
 """
 
-import argparse
+import json
 import time
 import numpy as np
 import cupy as cp
@@ -52,36 +64,10 @@ from voxel_fem_solver_nonlinear import VoxelFEMSolverNonlinear
 from kernels_cupy_nl import compute_f_int_cupy, build_B_gauss
 
 
-# ---------------------------------------------------------------------------
-# Label -> Young's modulus mapping  (edit here to change material properties)
-# ---------------------------------------------------------------------------
-LABEL_MODULI = {
-    0:    1.0e-6,   # void  (near-zero; excluded via solid_mask)
-    1:    1.8e0,    # matrix (PA66) [GPa]
-    2:   72.0e0,    # fibres (glass fibres)  [GPa]
-    255:  1.0e-6,   # air   (near-zero; excluded via solid_mask)
-}
-
 # Labels treated as void/air: removed from the FEM system via solid_mask.
 VOID_LABELS = {0, 255}
 
 _AXIS_NAMES = ["x", "y", "z"]
-
-
-# ---------------------------------------------------------------------------
-# Material table: label value -> Young's modulus
-# ---------------------------------------------------------------------------
-
-def build_label_material_table(label_moduli=LABEL_MODULI):
-    """
-    Build a length-256 material table from ``label_moduli`` (dict label->E).
-    Labels not listed default to E_void (the value for label 0, or 1e-6).
-    """
-    E_void = label_moduli.get(0, 1e-6)
-    table = np.full(256, E_void, dtype=np.float32)
-    for lbl, E in label_moduli.items():
-        table[int(lbl)] = float(E)
-    return table
 
 
 # ---------------------------------------------------------------------------
@@ -157,7 +143,7 @@ def build_affine_u0(Nx, Ny, Nz, strain, nu, axis):
 # Effective modulus from the reaction force on the loaded end-face
 # ---------------------------------------------------------------------------
 
-def effective_modulus(u, material_table, voxels, nu, axis, strain,
+def effective_modulus(u, E_voxels, Nx, Ny, Nz, nu, axis, strain,
                       solid_mask=None):
     """
     E_eff = (F_axis / A_total) / strain, where F_axis is the summed reaction
@@ -165,10 +151,9 @@ def effective_modulus(u, material_table, voxels, nu, axis, strain,
     `axis` (unit-cube voxels, full face).
     """
     from constitutive import ConstitutiveModel
-    Nx, Ny, Nz = voxels.shape
-    mat = ConstitutiveModel("linear", E_void=float(material_table.min()),
-                            E_max=float(material_table.max()))
-    E0_gpu = cp.asarray(material_table[voxels.ravel()].astype(np.float32))
+    mat = ConstitutiveModel("linear", E_void=float(E_voxels.min()),
+                            E_max=float(E_voxels.max()))
+    E0_gpu = cp.asarray(E_voxels.ravel().astype(np.float32))
     B_cpu, w_cpu = build_B_gauss()
     B_gpu = cp.asarray(B_cpu.astype(np.float32))
     w_gpu = cp.asarray(w_cpu.astype(np.float32))
@@ -198,90 +183,103 @@ def effective_modulus(u, material_table, voxels, nu, axis, strain,
 # ---------------------------------------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(
-        description="Linear-elastic voxel FEM simulation of CT data, uniaxial tension")
-    p.add_argument("--data", default="exp_data.npz",
-                   help="path to the .npz file with a 'labels' array (default exp_data.npz)")
-    p.add_argument("--axis", choices=["x", "y", "z"], default="z",
-                   help="loading axis (default z)")
-    p.add_argument("--strain", type=float, default=0.01,
-                   help="applied uniaxial strain (default 0.01 = 1%%)")
-    p.add_argument("--nu", type=float, default=0.3,
-                   help="Poisson ratio (default 0.3)")
-    p.add_argument("--maxiter", type=int, default=100,
-                   help="maximum PCG iterations (default 100)")
-    p.add_argument("--preconditioner", choices=["jacobi", "multigrid"],
-                   default="multigrid",
-                   help="PCG preconditioner (default multigrid)")
-    p.add_argument("--smoother", choices=["jacobi", "chebyshev"],
-                   default="chebyshev",
-                   help="multigrid smoother (default chebyshev; "
-                        "ignored for --preconditioner jacobi)")
-    p.add_argument("--vtk", default="ct_result",
-                   help="write per-voxel stress/strain to <prefix>.vti "
-                        "(default 'ct_result'; set to '' to disable)")
-    args = p.parse_args()
+    # Load parameters from JSON file
+    with open("simulateCT.json", "r") as f:
+        config = json.load(f)
 
-    axis = {"x": 0, "y": 1, "z": 2}[args.axis]
-    aname = args.axis
+    # Extract and remove help documentation (if present)
+    help_doc = config.pop("_help", {})
+
+    # Validate and set defaults
+    config.setdefault("data", "exp_data.npz")
+    config.setdefault("axis", "z")
+    config.setdefault("strain", 0.01)
+    config.setdefault("nu", 0.3)
+    config.setdefault("maxiter", 100)
+    config.setdefault("preconditioner", "multigrid")
+    config.setdefault("smoother", "chebyshev")
+    config.setdefault("vtk", "ct_result")
+
+    args = config
+
+    # Validate axis choice
+    if args["axis"] not in ["x", "y", "z"]:
+        raise ValueError(f"axis must be 'x', 'y', or 'z', got '{args['axis']}'")
+
+    # Validate preconditioner choice
+    if args["preconditioner"] not in ["jacobi", "multigrid"]:
+        raise ValueError(f"preconditioner must be 'jacobi' or 'multigrid', got '{args['preconditioner']}'")
+
+    # Validate smoother choice
+    if args["smoother"] not in ["jacobi", "chebyshev"]:
+        raise ValueError(f"smoother must be 'jacobi' or 'chebyshev', got '{args['smoother']}'")
+
+    axis = {"x": 0, "y": 1, "z": 2}[args["axis"]]
+    aname = args["axis"]
 
     print("=" * 70)
     print(f"  VOXEL FEM — CT data, linear elasticity, {aname}-tension")
     print("=" * 70)
 
     # --- Load data -----------------------------------------------------------
-    data = np.load(args.data)
-    voxels = data["labels"].astype(np.uint8)
-    Nx, Ny, Nz = voxels.shape
+    data = np.load(args["data"])
+    voxels_labels = data["labels"].astype(np.uint8)
+    E_voxels = data["Young_modulus"].astype(np.float32)
+    Nx, Ny, Nz = E_voxels.shape
     dims = [Nx, Ny, Nz]
-    labels = np.unique(voxels)
-    print(f"  Data  : {args.data}")
+    labels = np.unique(voxels_labels)
+    print(f"  Data  : {args['data']}")
     print(f"  Grid  : {Nx}×{Ny}×{Nz} = {Nx*Ny*Nz:,} voxels")
     print(f"  Labels present : {labels.tolist()}")
+    print(f"  Young's modulus range: [{E_voxels.min():.4f}, {E_voxels.max():.4f}] GPa")
 
     # --- Solid/void mask: labels 0 (void) and 255 (air) are excluded ---------
-    solid_mask = ~np.isin(voxels, sorted(VOID_LABELS))
+    solid_mask = ~np.isin(voxels_labels, sorted(VOID_LABELS))
     n_solid = int(solid_mask.sum())
     n_void  = Nx * Ny * Nz - n_solid
-    print(f"  Solid voxels   : {n_solid:,} / {Nx*Ny*Nz:,} "
+    print(f"\n  Solid voxels   : {n_solid:,} / {Nx*Ny*Nz:,} "
           f"({100*n_solid/(Nx*Ny*Nz):.1f}%)")
     print(f"  Void/air voxels: {n_void:,} "
           f"(labels {sorted(VOID_LABELS)} — excluded from system)")
 
-    # --- Material table: label i -> E ----------------------------------------
-    material_table = build_label_material_table(LABEL_MODULI)
-    print("  Material table (label -> E):")
-    for lbl in labels:
-        tag = "  ← void (masked out)" if lbl in VOID_LABELS else ""
-        print(f"      {int(lbl):3d} -> {material_table[lbl]:8.4f}{tag}")
+    # --- E_voxels loaded directly from file -----------------------------------
+    E_min = E_voxels.min()
+    E_max = E_voxels.max()
+    print(f"\n  E range from file : [{E_min:.4f}, {E_max:.4f}] GPa")
+
+    # --- Convert to voxel format: linear interpolation mode ---
+    # Map E_voxels [E_min, E_max] → uint8 [0, 255]
+    voxels = np.uint8(255.0 * (E_voxels - E_min) / (E_max - E_min))
 
     # --- Solver (linear elasticity) -----------------------------------------
+    # Use linear interpolation mode: voxel values [0,255] map to [E_void, E_max]
     solver = VoxelFEMSolverNonlinear(
         voxels,
-        nu=args.nu,
-        material_table=material_table,
+        nu=args["nu"],
+        E_void=E_min,
+        E_max=E_max,
         solid_mask=solid_mask,
         is_linear=True,
         tol_pcg=1e-8,
-        max_pcg_iter=args.maxiter,
-        preconditioner=args.preconditioner,
-        mg_smoother=args.smoother,
+        max_pcg_iter=args["maxiter"],
+        preconditioner=args["preconditioner"],
+        mg_smoother=args["smoother"],
         verbose=True,
     )
 
     # --- Boundary conditions: uniaxial tension, lateral faces free ----------
     # Domain length along loading axis = dims[axis] (unit cubes).
-    delta = args.strain * dims[axis]
+    delta = args["strain"] * dims[axis]
     node_idx = build_node_index(Nx, Ny, Nz)
     apply_uniaxial_bc(solver, node_idx, axis, delta)
 
-    print(f"\n  Applied {aname}-strain  : {args.strain*100:.2f}%  "
+    print(f"\n  Applied {aname}-strain  : {args['strain']*100:.2f}%  "
           f"(Δ = {delta:.4f}, L{aname} = {dims[axis]})")
-    print(f"  Poisson ratio    : {args.nu}")
-    print(f"  Max PCG iters    : {args.maxiter}")
-    print(f"  Preconditioner   : {args.preconditioner}")
-    if args.preconditioner == "multigrid":
-        print(f"  MG smoother      : {args.smoother}")
+    print(f"  Poisson ratio    : {args['nu']}")
+    print(f"  Max PCG iters    : {args['maxiter']}")
+    print(f"  Preconditioner   : {args['preconditioner']}")
+    if args["preconditioner"] == "multigrid":
+        print(f"  MG smoother      : {args['smoother']}")
 
     # --- Floating-island diagnostic -----------------------------------------
     print()
@@ -303,7 +301,7 @@ def main():
         print(f"  → Their DOFs are decoupled via the void mask and stay at zero.")
 
     # --- Affine initial displacement field -----------------------------------
-    u0 = build_affine_u0(Nx, Ny, Nz, args.strain, args.nu, axis)
+    u0 = build_affine_u0(Nx, Ny, Nz, args["strain"], args["nu"], axis)
     print(f"\n  Affine u0 seeded  : {aname}-displ range "
           f"[{u0[axis::3].min():.4f}, {u0[axis::3].max():.4f}]")
 
@@ -323,30 +321,30 @@ def main():
         tag = f"(prescribed Δ = {delta:.6f})" if d == axis else "(Poisson contraction)"
         print(f"  {dname}-disp range      : [{disp[d].min():.6f}, {disp[d].max():.6f}]  {tag}")
 
-    E_eff, F_reaction = effective_modulus(u, material_table, voxels, args.nu,
-                                          axis, args.strain, solid_mask=solid_mask)
-    non_void_labels = labels[~np.isin(labels, sorted(VOID_LABELS))]
-    E_lo = material_table[non_void_labels].min() if len(non_void_labels) else 0.0
-    E_hi = material_table[non_void_labels].max() if len(non_void_labels) else 0.0
+    E_eff, F_reaction = effective_modulus(u, E_voxels, Nx, Ny, Nz, args["nu"],
+                                          axis, args["strain"], solid_mask=solid_mask)
+    # Compute E range from solid voxels only
+    E_solid = E_voxels[solid_mask]
+    E_lo = E_solid.min() if len(E_solid) > 0 else 0.0
+    E_hi = E_solid.max() if len(E_solid) > 0 else 0.0
     print(f"\n  Far-face {aname}-reaction   : {F_reaction:.4f}")
     print(f"  Effective E_{aname}          : {E_eff:.4f}")
     print(f"  (solid phase moduli   : [{E_lo:.3f}, {E_hi:.3f}] — "
           f"E_eff should lie within or below)")
 
     # --- VTI output (default on) --------------------------------------------
-    if args.vtk:
+    if args["vtk"]:
         from tests.validation.report import (element_stress, element_strain,
                                              build_conn_dof)
         from vtk_export import save_stress_strain_vti
         conn = build_conn_dof(Nx, Ny, Nz)
-        E0 = material_table[voxels.ravel()].astype(np.float32)
+        E0 = E_voxels.ravel().astype(np.float32)  # per-voxel moduli from file
         strain_field = element_strain(u, conn)
-        stress_field = element_stress(u, E0, conn, args.nu)
-        vti_path = args.vtk if args.vtk.endswith(".vti") else args.vtk + ".vti"
+        stress_field = element_stress(u, E0, conn, args["nu"])
+        vti_path = args["vtk"] if args["vtk"].endswith(".vti") else args["vtk"] + ".vti"
         save_stress_strain_vti(vti_path, (Nx, Ny, Nz), strain_field, stress_field,
-                               extra={"label": voxels.ravel().astype(np.float64),
-                                      "youngs_modulus": E0.astype(np.float64),
-                                      "solid_mask": solid_mask.ravel().astype(np.float64)})
+                               extra={"youngs_modulus": E0,
+                                      "solid_mask": solid_mask.ravel()})
         print(f"\n  Wrote VTI: {vti_path}")
 
     print(f"\n{'='*70}")

@@ -39,6 +39,8 @@ Typical use
 
 import numpy as np
 
+# Output float datatype for VTK export — change here to float64 if needed
+OUTPUT_DTYPE = np.float32
 
 # ---------------------------------------------------------------------------
 # Equivalent (effective) scalar measures
@@ -52,7 +54,7 @@ def von_mises_strain(eps):
     ----------
     eps : (..., 6) array — Voigt [xx, yy, zz, xy, yz, xz], engineering shears.
     """
-    eps = np.asarray(eps, dtype=np.float64)
+    eps = np.asarray(eps, dtype=OUTPUT_DTYPE)
     exx, eyy, ezz = eps[..., 0], eps[..., 1], eps[..., 2]
     gxy, gyz, gxz = eps[..., 3], eps[..., 4], eps[..., 5]
     emean = (exx + eyy + ezz) / 3.0
@@ -73,7 +75,7 @@ def von_mises_stress(sigma):
     ----------
     sigma : (..., 6) array — Voigt [xx, yy, zz, xy, yz, xz].
     """
-    sigma = np.asarray(sigma, dtype=np.float64)
+    sigma = np.asarray(sigma, dtype=OUTPUT_DTYPE)
     sxx, syy, szz = sigma[..., 0], sigma[..., 1], sigma[..., 2]
     sxy, syz, sxz = sigma[..., 3], sigma[..., 4], sigma[..., 5]
     return np.sqrt(0.5 * ((sxx - syy)**2 + (syy - szz)**2 + (szz - sxx)**2)
@@ -174,8 +176,8 @@ def save_stress_strain_vtk(filename, grid_shape, strain, stress,
     -------
     fields : dict of every field written (name -> array)
     """
-    strain = np.asarray(strain, dtype=np.float64)
-    stress = np.asarray(stress, dtype=np.float64)
+    strain = np.asarray(strain, dtype=OUTPUT_DTYPE)
+    stress = np.asarray(stress, dtype=OUTPUT_DTYPE)
 
     fields = {
         "effective_strain": von_mises_strain(strain),
@@ -205,7 +207,7 @@ def save_stress_strain_vtk(filename, grid_shape, strain, stress,
 
 def voigt_to_sym6(t, is_strain):
     """(Ne,6) Voigt -> (Ne,6) VTK symmetric tensor [xx,yy,zz,xy,yz,xz]."""
-    out = np.asarray(t, dtype=np.float64).copy()
+    out = np.asarray(t, dtype=OUTPUT_DTYPE).copy()
     if is_strain:
         out[:, 3:] *= 0.5            # engineering -> tensor shear
     return out
@@ -213,11 +215,11 @@ def voigt_to_sym6(t, is_strain):
 
 def voigt_to_full9(t, is_strain):
     """(Ne,6) Voigt -> (Ne,9) row-major full 3x3 tensor (00,01,02,10,11,...)."""
-    t = np.asarray(t, dtype=np.float64)
+    t = np.asarray(t, dtype=OUTPUT_DTYPE)
     xx, yy, zz, xy, yz, xz = (t[:, i] for i in range(6))
     if is_strain:
         xy, yz, xz = xy * 0.5, yz * 0.5, xz * 0.5
-    T = np.empty((t.shape[0], 9), dtype=np.float64)
+    T = np.empty((t.shape[0], 9), dtype=OUTPUT_DTYPE)
     T[:, 0], T[:, 1], T[:, 2] = xx, xy, xz
     T[:, 3], T[:, 4], T[:, 5] = xy, yy, yz
     T[:, 6], T[:, 7], T[:, 8] = xz, yz, zz
@@ -265,8 +267,8 @@ def save_stress_strain_vti(filename, grid_shape, strain, stress, extra=None,
 
     Nx, Ny, Nz = grid_shape
     Ne = Nx * Ny * Nz
-    strain = np.asarray(strain, dtype=np.float64)
-    stress = np.asarray(stress, dtype=np.float64)
+    strain = np.asarray(strain, dtype=OUTPUT_DTYPE)
+    stress = np.asarray(stress, dtype=OUTPUT_DTYPE)
 
     # Element order is z-fastest (C-order over (Nx,Ny,Nz)); VTK ImageData cells
     # are x-fastest.  This permutation maps one to the other.
