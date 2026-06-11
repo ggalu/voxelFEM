@@ -201,6 +201,10 @@ class GeometricMultigrid:
         self.levels = []
         img = voxels.copy()
         level_idx = 0
+        # For GPU hierarchy building, keep the current level on GPU to amortize
+        # coarsening operations. Transfer back to CPU for GridLevel constructor.
+        if use_gpu:
+            img_gpu = cp.asarray(img)
         while True:
             level = GridLevel(img.shape[0], img.shape[1], img.shape[2],
                              img, E_max, E_void, nu,
@@ -213,7 +217,11 @@ class GeometricMultigrid:
             if max(img.shape) < 4:
                 break
 
-            img = self._coarsen_image_anisotropic(img)
+            if use_gpu:
+                img = self._coarsen_image_anisotropic_gpu(img_gpu)
+                img_gpu = cp.asarray(img)
+            else:
+                img = self._coarsen_image_anisotropic(img)
             level_idx += 1
 
         # Propagate the fine constrained-DOF mask down the hierarchy so every
@@ -275,6 +283,28 @@ class GeometricMultigrid:
         return np.clip(a + 0.5, 0, 255).astype(np.uint8)
 
     @staticmethod
+    def _coarsen_image_gpu(img_gpu) -> np.ndarray:
+        """
+        Coarsen voxel image by 2× in each dimension using CuPy, then transfer
+        result back to CPU as uint8.
+
+        Uses cp.add.reduceat (GPU-resident) for speed, avoiding repeated
+        CPU↔GPU transfers during the hierarchy build.
+        """
+        a = img_gpu.astype(cp.float64)
+        for axis in range(3):
+            n = a.shape[axis]
+            starts = cp.arange(0, n, 2)
+            block_sum = cp.add.reduceat(a, starts, axis=axis)
+            counts = cp.add.reduceat(cp.ones(n), starts)
+            shape = [1, 1, 1]
+            shape[axis] = len(starts)
+            a = block_sum / counts.reshape(shape)
+        # Transfer back to CPU as uint8 for the next level's GridLevel constructor
+        a_np = cp.asnumpy(cp.clip(a + 0.5, 0, 255).astype(cp.uint8))
+        return a_np
+
+    @staticmethod
     def _coarsen_image_anisotropic(img: np.ndarray) -> np.ndarray:
         """
         Coarsen only dimensions whose current size is ≥ 4; freeze smaller ones.
@@ -298,6 +328,30 @@ class GeometricMultigrid:
             shape[axis] = len(starts)
             a = block_sum / counts.reshape(shape)
         return np.clip(a + 0.5, 0, 255).astype(np.uint8)
+
+    @staticmethod
+    def _coarsen_image_anisotropic_gpu(img_gpu) -> np.ndarray:
+        """
+        Coarsen only dimensions whose current size is ≥ 4; freeze smaller ones.
+        GPU-resident version using CuPy.
+
+        Transfers result back to CPU as uint8 for the next level's GridLevel
+        constructor. This batches GPU coarsening operations and amortizes the
+        GPU↔CPU transfer overhead.
+        """
+        a = img_gpu.astype(cp.float64)
+        for axis in range(3):
+            n = a.shape[axis]
+            if n < 4:
+                continue
+            starts = cp.arange(0, n, 2)
+            block_sum = cp.add.reduceat(a, starts, axis=axis)
+            counts = cp.add.reduceat(cp.ones(n), starts)
+            shape = [1, 1, 1]
+            shape[axis] = len(starts)
+            a = block_sum / counts.reshape(shape)
+        a_np = cp.asnumpy(cp.clip(a + 0.5, 0, 255).astype(cp.uint8))
+        return a_np
 
     @staticmethod
     def _prolong_matrix_1d(n_fine: int, n_coarse: int) -> np.ndarray:
