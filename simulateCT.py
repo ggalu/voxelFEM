@@ -332,20 +332,46 @@ def main():
     print(f"  (solid phase moduli   : [{E_lo:.3f}, {E_hi:.3f}] — "
           f"E_eff should lie within or below)")
 
+    # --- Compute stress and strain fields (used for VTI and NPZ output) ------
+    from tests.validation.report import (element_stress, element_strain,
+                                         build_conn_dof)
+    conn = build_conn_dof(Nx, Ny, Nz)
+    E0 = E_voxels.ravel().astype(np.float32)  # per-voxel moduli from file
+    strain_field = element_strain(u, conn)  # (Ne, 6) with Voigt order
+    stress_field = element_stress(u, E0, conn, args["nu"])  # (Ne, 6)
+
+    # Compute von Mises stress and strain
+    # stress_field and strain_field are (Ne, 6) with Voigt order [xx, yy, zz, xy, yz, xz]
+    Sxx, Syy, Szz = stress_field[:, 0], stress_field[:, 1], stress_field[:, 2]
+    Sxy, Syz, Sxz = stress_field[:, 3], stress_field[:, 4], stress_field[:, 5]
+    Exx, Eyy, Ezz = strain_field[:, 0], strain_field[:, 1], strain_field[:, 2]
+    Exy, Eyz, Exz = strain_field[:, 3], strain_field[:, 4], strain_field[:, 5]
+
+    # von Mises stress: σ_vm = sqrt(((Sxx-Syy)^2 + (Syy-Szz)^2 + (Szz-Sxx)^2 + 6*(Sxy^2 + Syz^2 + Sxz^2)) / 2)
+    stress_vm = np.sqrt(((Sxx - Syy)**2 + (Syy - Szz)**2 + (Szz - Sxx)**2 +
+                         6 * (Sxy**2 + Syz**2 + Sxz**2)) / 2.0).astype(np.float32)
+    stress_vm = stress_vm.reshape(Nx, Ny, Nz)
+
+    # von Mises strain: ε_vm = sqrt((1/3) * ((Exx-Eyy)^2 + (Eyy-Ezz)^2 + (Ezz-Exx)^2 + 2*(Exy^2 + Eyz^2 + Exz^2)))
+    strain_vm = np.sqrt(((Exx - Eyy)**2 + (Eyy - Ezz)**2 + (Ezz - Exx)**2 +
+                         2 * (Exy**2 + Eyz**2 + Exz**2)) / 3.0).astype(np.float32)
+    strain_vm = strain_vm.reshape(Nx, Ny, Nz)
+
     # --- VTI output (default on) --------------------------------------------
     if args["vtk"]:
-        from tests.validation.report import (element_stress, element_strain,
-                                             build_conn_dof)
         from vtk_export import save_stress_strain_vti
-        conn = build_conn_dof(Nx, Ny, Nz)
-        E0 = E_voxels.ravel().astype(np.float32)  # per-voxel moduli from file
-        strain_field = element_strain(u, conn)
-        stress_field = element_stress(u, E0, conn, args["nu"])
         vti_path = args["vtk"] if args["vtk"].endswith(".vti") else args["vtk"] + ".vti"
         save_stress_strain_vti(vti_path, (Nx, Ny, Nz), strain_field, stress_field,
                                extra={"youngs_modulus": E0,
                                       "solid_mask": solid_mask.ravel()})
         print(f"\n  Wrote VTI: {vti_path}")
+
+    # --- Save effective stress and strain as numpy array ----------------------
+    # Stack along last axis: shape (Nx, Ny, Nz, 2) where last index is [stress, strain]
+    results = np.stack([stress_vm, strain_vm], axis=-1).astype(np.float32)
+    npy_path = args["vtk"] if args["vtk"].endswith(".npy") else args["vtk"] + "_results.npy"
+    np.save(npy_path, results)
+    print(f"  Wrote effective stress and strain: {npy_path}")
 
     print(f"\n{'='*70}")
     print("  Simulation complete.")
