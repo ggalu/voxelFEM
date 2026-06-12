@@ -70,7 +70,7 @@ class GridLevel:
         else:
             # ----- GPU path: implicit connectivity, no conn_dof stored -----
             from kernels_cupy_nl import build_diagonal_cupy
-            self.E_elem = xp.asarray(E_elem_cpu, dtype=xp.float32)
+            self.E_elem = xp.asarray(E_elem_cpu, dtype=xp.float16)
             self.K_ref = xp.asarray(K_ref_cpu.astype(np.float32))
             self.conn_dof = None
             diag_ref = xp.asarray(np.diag(K_ref_cpu).astype(np.float32))
