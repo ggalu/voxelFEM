@@ -21,7 +21,7 @@ incremental load stepping, and **inexact-Newton inner PCG** solves.
 ## Commands
 
 ```bash
-# Run all tests (47 tests). The core kernel/solver tests require CuPy/GPU —
+# Run all tests (57 tests). The core kernel/solver tests require CuPy/GPU —
 # they skip if CuPy is absent; the layered-validation reference and multigrid
 # tests are pure NumPy and always run.
 python -m pytest tests/ -v --tb=short
@@ -56,6 +56,20 @@ python measure_vram.py                          # all three benchmark sizes
 python measure_vram.py 200                      # single size
 python measure_vram.py 100 200 --preconditioner jacobi
 
+# CT data pipeline: preprocessing + FEM simulation (requires preprocess.json / simulateCT.json configs)
+# Stage 1: Map CT grey levels → Young's modulus
+python preprocess.py                            # reads preprocess.json, outputs Young_modulus field
+python preprocess.py --config custom_config.json
+
+# Stage 2: Linear-elastic FEM solve on CT data with void/air masking
+python simulateCT.py                            # reads simulateCT.json, outputs .vti with stress/strain fields
+
+# Synthetic RVE (representative volume element) simulation
+python simulateRVE.py                           # loads kanapy RVE, runs linear FEM, outputs .vti
+
+# Napari visualization of CT results
+python view.py                                  # displays ct_result_results.npy layers
+
 # Crop .npz volumetric data (for testing / analysis)
 # Crops to a centered region, with optional 3D offset; displays central slices (X, Y, Z)
 python crop_numpy_array.py input.npz output.npz 40 40 40                    # centered crop
@@ -65,7 +79,7 @@ python3 crop_numpy_array.py ~/Archiv/seg_unload_post.npz free_surface.npz 50 370
 ```
 
 **After every change to a `.py` file, run the test suite before proceeding.**
-All 47 tests must stay green. **Do not move on if any test fails** — fix the
+All 57 tests must stay green. **Do not move on if any test fails** — fix the
 regression first. The single most important test is
 `test_matvec_tangent_fd_consistency`: it verifies
 `(f_int(u+hv) − f_int(u))/h ≈ K_t(u)·v`. If it fails, the NR solver will not
@@ -253,7 +267,7 @@ CT microstructures). It **stalls on strictly alternating per-voxel moduli**
 neighbour has a different modulus): those cancel under 2×2×2 averaging so the
 coarse grid loses all stiffness variation, κ collapses to ~1e31, and the V-cycle
 contributes nothing. Use Jacobi for those patterns. By contrast, a fibrous
-microstructure like `exp_data.npz` (fibers form multi-voxel clusters, contrast
+microstructure like `assets/PA66GF30.npz` (fibers form multi-voxel clusters, contrast
 10:1) converges in ~30 PCG iters with multigrid while plain Jacobi fails to
 converge in 500 iters — so for realistic CT data, multigrid is the right choice
 and Jacobi should be avoided. The distinguishing criterion is not "voxel-scale
@@ -297,207 +311,9 @@ contrast 10 the effective modulus error was measured at 44%; at contrast 1000
 it reached 962%. Float32 is required for accurate stiffness extraction at any
 practically useful contrast.
 
-### GPU memory budget (300M elements, 48 GB VRAM)
-
-Measured on the layered example (multigrid preconditioner, clean 64 MB baseline,
-all float32 — commits `a85425a` + `9560a16` + `60449df`):
-
-| Grid | Voxels | DOFs | Peak VRAM | bytes/DOF |
-|------|--------|------|-----------|-----------|
-| 100³ | 1 M    | 3.1 M  | 904 MB  | 307 |
-| 150³ | 3.4 M  | 10.3 M | 1.9 GB  | 197 |
-| 200³ | 8 M    | 24.4 M | 2.7 GB  | 118 |
-
-bytes/DOF falls with grid size because the fixed chunk overhead (~800 MB for
-`chunk_size=2 M`) dominates at small grids. At target scale it is negligible.
-
-**Projected budget at 300 M voxels (N≈669, Ndof≈902 M)** — commit `13e049e`:
-
-| Item | GB | Notes |
-|---|---|---|
-| `conn_dof` (implicit — never stored) | 0.0 | |
-| `E0_elem` (float16) | 0.6 | 300 M × 2 B |
-| `B_gauss` (8 × 6×24 float32) | 0.0 | constant, tiny |
-| u (float32) | 3.6 | 902 M × 4 B |
-| f\_int / R / r (float32, one buffer) | 3.6 | R aliases f\_int; r aliases R in PCG |
-| x / Δu, p (=z), Ap (float32, PCG) | 10.8 | 3 × 902 M × 4 B |
-| MG fine-level diagonal (float32) | 3.6 | 902 M × 4 B (`omega_diag_inv` removed) |
-| MG coarse diagonals (geom. series) | 0.5 | sum ≈ 1/7 × fine |
-| `bc_dofs_gpu` / `GridLevel.bc_mask` (int32) | 0.0 | O(N^{2/3}) face DOFs, ~tens MB |
-| Chunk working buffers (2 M chunk) | 1.0 | constant regardless of Ne |
-| CuPy pool cache (retained blocks) | ~1.0 | unique alloc sizes, also constant |
-| **Total** | **~25 GB** ✓ | 23 GB headroom at 48 GB |
-
-**Empirically measured capacity (2026-06-04, commit `d6c57b0`)**: on a clean
-48 GB GPU the solver runs successfully up to **~250 M voxels** and fails with
-OOM beyond that. The 300 M voxel target therefore **exceeds the current
-hardware capacity** by ~20%.
-
-**Capacity ceiling**: linear fit to the three small-scale measurements gives
-`VRAM ≈ 827 MB (fixed) + 251 MB/M_vox × Ne`. At 48 GB available:
-ceiling ~192 M voxels (≈ 577³); at 300 M voxels: ~74 GB extrapolated
-(note: small-scale fit over-estimates at target scale — see note below).
-
-> **Extrapolation caveat**: the fit is dominated by the fixed chunk
-> overhead (~800 MB, constant for `chunk_size=2 M`) which inflates the
-> apparent per-voxel slope. At 300 M voxels the chunk term is <1% of
-> total; the true asymptotic cost per DOF converges to ~25 B/DOF
-> (see budget table above). The ~25 GB analytic projection is optimistic
-> relative to the empirically measured ~250 M voxel OOM ceiling; the gap
-> is likely due to CuPy pool fragmentation and V-cycle transient
-> allocations not captured in the steady-state table.
-
-### VRAM reduction techniques (commits `a85425a`, `9560a16`, `60449df`)
-
-Ten independent changes cut peak VRAM versus the initial design.
-All 47 tests remain green after each change.
-
-**Batch 1 — commit `a85425a`**
-
-1. **D\_t tensor elimination** (`kernels_cupy_nl.py`).  
-   Previously `build_D_cupy` was called once per Gauss point per chunk, creating
-   a `(chunk, 6, 6)` float32 tensor (288 MB at chunk\_size = 2 M). Replaced with
-   a fused computation: the constant `D_ref` (6×6) is built once per kernel call
-   and contracted on-the-fly: `σ = E_t[:,None] · einsum('ij,cj->ci', D_ref, ε)`.
-   The `(chunk, 6, 6)` tensor is never materialised. Saves 8 × 288 MB = 2.3 GB
-   peak per kernel invocation.
-
-2. **Explicit `del` after each chunk temporary — nonlinear kernels**
-   (`kernels_cupy_nl.py`).  
-   `del` on CuPy arrays immediately drops the refcount to zero, returning the
-   block to the pool before the next allocation. Applied to `dofs`, `u_local`,
-   `v_local`, `eps`, `D_ref_eps`, `E_t`, `eps_vm`, `sigma`/`scaled`, `f_loc` /
-   `Kv_loc`, and the intermediate connectivity arrays inside `_get_elem_dofs`.
-
-3. **Sparse BC and force storage** (`voxel_fem_solver_nonlinear.py`).  
-   The two dense `(Ndof,)` float32 arrays `bc_step_gpu` and `f_target_gpu` (each
-   3.6 GB at 300 M voxels) are replaced by compact index + value arrays.
-   Saves up to 2 × 3.6 = 7.2 GB.
-
-4. **In-place residual construction** (`voxel_fem_solver_nonlinear.py`).  
-   `R = f_target - f_int` previously required both arrays live simultaneously.
-   Replaced with `cp.negative(f_int, out=f_int)` + sparse scatter; R aliases
-   f\_int's buffer. Saves one `(Ndof,)` float32 allocation (3.6 GB at 300 M).
-
-5. **V-cycle `del r_res` before recursion** (`multigrid.py`).  
-   The fine-level residual was live throughout coarse recursion and post-smooth.
-   `del r_res` immediately after `_restrict` lets the pool reuse that memory.
-   `copy_input=False` on smoother calls removes the defensive `u.copy()`.
-
-6. **Free old MG hierarchy before rebuild** (`multigrid_nl.py`).  
-   `del self._gmg; cp.get_default_memory_pool().free_all_blocks()` before
-   rebuilding ensures the old hierarchy's GPU memory is released to the OS before
-   the new one is allocated. Prevents old and new hierarchies from coexisting.
-
-**Batch 2 — commit `9560a16`**
-
-7. **PCG simplification: `p` always float32, `r_free` eliminated**
-   (`voxel_fem_solver_nonlinear.py`).  
-   The CG direction `p` is now always float32 (`p = z`, no `astype`). This was
-   motivated by discovering that half-precision `p` caused float16 overflow for
-   poorly-conditioned problems. As a by-product, the residual norm is now computed
-   as `cp.dot(r, r)` directly (r is already zeroed at BC DOFs each iteration),
-   eliminating the `r_free = r[free_gpu]` sub-vector copy (~3.6 GB transient at
-   300 M voxels per convergence check). `copy=False` on the x update avoids two
-   redundant Ndof allocations per PCG iteration when storage is float32.
-
-8. **MG `E_elem` → float16** (`multigrid.py`).  
-   `GridLevel` stores `E_elem` as float16 on the GPU path. CuPy auto-promotes
-   float16 × float32 → float32 in `matvec_Ku_cupy` and `build_diagonal_cupy`.
-   Saves ~0.6 GB at the fine level for 300 M voxels (was float32, duplicating
-   `E0_elem_gpu` which is already float16 in the solver).
-
-9. **Explicit `del` in MG kernels** (`kernels_cupy_nl.py`).  
-   `matvec_Ku_cupy` and `build_diagonal_cupy` now delete `elem_ids`, `dofs`,
-   `u_loc`, `Ku_loc`, and `contrib` at the end of each chunk, matching the
-   nonlinear kernels. Reduces pool fragmentation during hierarchy builds.
-
-10. **Precompute `omega_diag_inv`** (`multigrid.py`).  
-    `GridLevel` stores `omega_diag_inv = 0.67 × diag_inv` at construction and
-    after `set_bc()`. The smoother uses `level.omega_diag_inv` directly,
-    eliminating one `(Ndof,)` float32 multiply per smooth iteration.
-    *This was subsequently reversed in Batch 4 (see below) — `omega_diag_inv`
-    is now removed entirely; the smoother uses fully in-place ops instead.*
-
-**Batch 3 — commit `60449df`**
-
-11. **Remove `half_precision` switch; solver simplified to float32 throughout**
-    (`voxel_fem_solver_nonlinear.py`).  
-    The session investigated storing u, Δu and the PCG solution accumulator x in
-    float16 or bfloat16 to save ~7 GB at 300 M voxels. Two fundamental blockers
-    were found and the option was removed entirely:
-
-    - **Float16 for p (CG direction) causes divergence.** The CG direction
-      vectors can grow large in ill-conditioned problems; float16 overflow
-      (max ≈ 65504) produces inf, zeroing alpha and stalling PCG permanently.
-      Fixing this by keeping p in float32 eliminates the overflow risk.
-
-    - **Float16 for u causes catastrophic cancellation in strain.** Even with p
-      in float32, returning u in float16 corrupts effective-modulus extraction:
-      per-element strain ε = u[i+1] − u[i] subtracts two nearly-equal values. In
-      the stiff phase of a C-contrast composite, the displacement increment per
-      element is C× smaller than the base displacement, amplifying float16 noise
-      by C in the strain and hence the reaction force. Measured: 44% error at
-      contrast 10; 962% error at contrast 1000. Float32 is required for any
-      physically meaningful stiffness extraction.
-
-    With the option removed the solver is simpler: no `astype` juggling in the
-    PCG loop, no `u_f32` upcast boilerplate in `_nr_step`/`_linear_step`, and no
-    BC-correction step on output. `_pcg_gpu` lost its `storage_dtype` parameter;
-    x is always float32 and `x += alpha * p` works directly.
-
-**Batch 4 — commit `13e049e`**
-
-Six structural changes cutting ~10 GB at 300 M voxels (from the true ~35 GB
-untracked peak to ~25 GB). All 47 tests remain green.
-
-12. **Remove `omega_diag_inv`; in-place smoother** (`multigrid.py`).  
-    `GridLevel` was storing a full duplicate Ndof float32 array
-    `omega_diag_inv = 0.67 × diag_inv` (item #10 above). That array is now
-    gone. The Jacobi smoother is rewritten to work in-place on the matvec
-    output:
-    ```
-    delta = level.matvec(u)     # one Ndof alloc (unavoidable)
-    delta -= f                   # in-place
-    delta *= level.diag_inv      # in-place
-    delta *= 0.67                # in-place scalar
-    u -= delta                   # in-place
-    ```
-    Previously `u = u + omega_diag_inv * r` allocated three Ndof temporaries
-    per smooth step (matvec output, `r = f − Ku`, `omega_diag_inv * r`, new u).
-    Now only one temporary exists at peak (delta). Combined fine + coarse:
-    **~4.1 GB persistent, ~7 GB transient peak reduction**.
-
-13. **`GridLevel.bc_mask` stored as int32 indices** (`multigrid.py`).  
-    `set_bc()` now calls `np.where(bc_mask)[0].astype(np.int32)` and stores
-    the compact index array on `xp`. BCs are face DOFs — O(N²ᐟ³) ≈ tens of MB
-    as int32, vs ~0.9 GB as a full-Ndof bool at the fine level. All downstream
-    fancy-indexing assignments (`w[bc_idx] = u[bc_idx]`, `r[bc_idx] = 0`)
-    work identically with int32. **~1.0 GB saved** across fine + coarse levels.
-
-14. **Eliminate `bc_mask_gpu` full-Ndof bool** (`voxel_fem_solver_nonlinear.py`).  
-    The solver no longer creates `bc_mask_gpu = cp.asarray(self.bc_mask)`.
-    All BC scatter/zero operations now use the sparse `bc_dofs_gpu` (int32)
-    already built for the BC value updates. **~0.9 GB saved**.
-
-15. **Eliminate `free_gpu` full-Ndof bool** (`voxel_fem_solver_nonlinear.py`).  
-    `free_gpu = ~bc_mask_gpu` was used only for norm computations
-    (`norm(f_int[free_gpu])`). Replaced by zeroing the BC DOFs of `f_int` in-
-    place (`f_int[bc_dofs_gpu] = 0.0`) and then taking `norm(f_int)`. This is
-    numerically identical since the BC entries become zero before the norm.
-    **~0.9 GB saved**.
-
-16. **Alias `r = b_gpu` in PCG — no copy** (`voxel_fem_solver_nonlinear.py`).  
-    `_pcg_gpu` previously started with `r = b_gpu.copy()` (3.6 GB). The copy
-    was defensive, but `b_gpu` (= R) already has BC DOFs zeroed by the caller,
-    and `b_gpu` is `del`-ed immediately after PCG returns. Aliasing `r = b_gpu`
-    makes f\_int / R / r *one buffer* throughout the solve, not two.
-    `r0 = dot(r,r)` is computed before the loop modifies `r` in-place.
-    **~3.6 GB saved**.
-
 ### Test layout
 
-All tests live in `tests/` (47 total). Each file inserts `sys.path` to find the
+All tests live in `tests/` (57 total). Each file inserts `sys.path` to find the
 parent directory — no `conftest.py`. The GPU tests are guarded with
 `pytestmark = pytest.mark.skipif(not CUPY_AVAILABLE, ...)`, so the suite skips
 cleanly with no GPU. Files:
@@ -517,6 +333,9 @@ cleanly with no GPU. Files:
   3 further GPU-guarded tests cross-validate the CuPy backend against the NumPy
   reference: `matvec_Ku_cupy` vs `matvec_Ku`, GPU V-cycle `apply()` vs CPU
   `apply()`, and GPU-multigrid-PCG vs Jacobi-PCG.
+- `test_void_handling.py` — void/air masking in CT data solves. Tests that void
+  elements and floating islands are handled correctly: no stiffness contribution,
+  convergence monitoring, and DOFs stay zero.
 
 ### Analytical validation: layered composite (`tests/validation/`)
 
@@ -727,7 +546,7 @@ estimates a fiber-matrix mixing model, and creates a per-voxel Young's modulus f
 **Configuration** (default: `preprocess.json`):
 ```json
 {
-  "input": "exp_data.npz",
+  "input": "assets/PA66GF30.npz",
   "label_key": "labels",
   "intensity_key": "intensity",
   "bins": 256,
@@ -763,7 +582,7 @@ python preprocess.py --config my_config.json
 ```
 
 **Output files**:
-- `exp_data.npz` — Updated in-place with new `Young_modulus` array
+- `assets/PA66GF30.npz` — Updated in-place with new `Young_modulus` array
 - `histogram_modulus.txt` — Tabular format: intensity bin center, voxel count, 
   fiber fraction, Young's modulus
 - `histogram_plot.png` — (if `output` set) Two-panel figure: grey-level histogram 
@@ -857,7 +676,7 @@ the cross-sectional area perpendicular to the loading axis.
 ```bash
 # 1. Preprocess: CT intensity → Young's modulus
 python preprocess.py --config preprocess.json
-# Output: exp_data.npz (updated with Young_modulus), histogram_plot.png, histogram_modulus.txt
+# Output: assets/PA66GF30.npz (updated with Young_modulus), histogram_plot.png, histogram_modulus.txt
 
 # 2. Simulate: FEM under uniaxial tension
 python simulateCT.py
@@ -903,5 +722,5 @@ slices perpendicular to X, Y, and Z axes. Each slice includes:
 - Individual colorbar
 - Proper axis labels
 
-**Example use case**: Reduce a large volumetric CT scan (`exp_data.npz`) to a 50³
+**Example use case**: Reduce a large volumetric CT scan (`assets/PA66GF30.npz`) to a 50³
 test region with controlled offset to sample a specific anatomical feature.
