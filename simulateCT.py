@@ -55,6 +55,8 @@ Example ``simulateCT.json``:
 """
 
 import json
+import os
+import sys
 import time
 import numpy as np
 import cupy as cp
@@ -62,6 +64,14 @@ import cupy as cp
 from geometry import build_node_index
 from voxel_fem_solver_nonlinear import VoxelFEMSolverNonlinear
 from kernels_cupy_nl import compute_f_int_cupy, build_B_gauss
+
+# Reuse the validation package's post-processing helpers. Imported via a
+# sys.path insert (not `from tests.validation.report import ...`) because a
+# `tests` package may already be installed in site-packages, which shadows
+# this repo's `tests/` (a namespace package, since it has no __init__.py).
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "tests", "validation"))
+from report import element_stress, element_strain, build_conn_dof  # noqa: E402
 
 
 # Labels treated as void/air: removed from the FEM system via solid_mask.
@@ -333,8 +343,6 @@ def main():
           f"E_eff should lie within or below)")
 
     # --- Compute stress and strain fields (used for VTI and NPZ output) ------
-    from tests.validation.report import (element_stress, element_strain,
-                                         build_conn_dof)
     conn = build_conn_dof(Nx, Ny, Nz)
     E0 = E_voxels.ravel().astype(np.float32)  # per-voxel moduli from file
     strain_field = element_strain(u, conn)  # (Ne, 6) with Voigt order
