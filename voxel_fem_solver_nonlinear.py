@@ -26,14 +26,14 @@ Constitutive models (via ConstitutiveModel):
   hardening : E_t = E0 · (1 + beta · eps_vm^n)
 
 GPU memory (300M elements, 48 GB VRAM):
-  E0_elem (float32):                  1.2 GB
+  E0_elem (float16):                   0.6 GB
   u, x/Δu, p, r, z (float32):       21.6 GB   (6 arrays × 3.6 GB)
   f_int/R, Ap (float32):             7.2 GB   (2 arrays × 3.6 GB)
   MG fine diagonal (float32):        3.6 GB
   MG coarse diagonals:               0.5 GB
   Chunk working buffers (2M chunk): ~1.0 GB
   CuPy pool cache:                  ~1.0 GB
-  Total:                            ~32 GB ✓ (16 GB headroom at 48 GB)
+  Total:                            ~31.4 GB ✓ (16.6 GB headroom at 48 GB)
 
 Example
 -------
@@ -238,7 +238,7 @@ class VoxelFEMSolverNonlinear:
         self.constitutive = constitutive or ConstitutiveModel(
             "linear", E_void=E_void, E_max=E_max
         )
-        self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float32)
+        self.E0_elem_gpu = cp.asarray(E0_cpu, dtype=cp.float16)
 
         # Solid/void mask (Stage 1: binary void elimination).
         # solid_elem_gpu : (Ne,) bool CuPy — True for load-bearing elements.
