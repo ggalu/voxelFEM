@@ -69,20 +69,18 @@ class NonlinearMultigrid:
 
         self.Nx, self.Ny, self.Nz = voxels.shape
 
-        # Build initial hierarchy from base voxels (before any deformation).
-        # E_void=0.0 so that void elements (uint8=0) contribute zero stiffness
-        # at every level, consistent with the fine-level solid_mask treatment.
-        self._gmg = GeometricMultigrid(
-            voxels, nu, E_max, 0.0,
-            n_levels=n_levels, n_pre=n_pre, n_post=n_post, bc_mask=self.bc_mask,
-            use_gpu=self.use_gpu, chunk_size=self.chunk_size,
-            smoother=self.smoother, chebyshev_c_ratio=self.chebyshev_c_ratio,
-        )
+        # The hierarchy is always rebuilt by update() before first use (called
+        # at the start of every NR iteration / the single linear step), so an
+        # initial build here would be discarded unused. Defer it — this avoids
+        # a redundant full hierarchy construction, which is O(N) CPU+GPU work
+        # that matters at large element counts.
+        self._gmg = None
 
     def set_bc_mask(self, bc_mask):
         """Attach the fine-grid constrained-DOF mask (call before solving)."""
         self.bc_mask = bc_mask
-        self._gmg._set_bcs(bc_mask)
+        if self._gmg is not None:
+            self._gmg._set_bcs(bc_mask)
 
     def update(self, u_gpu, force_rebuild=True):
         """
@@ -103,20 +101,25 @@ class NonlinearMultigrid:
         """
         Ne = int(self.E0_elem_gpu.shape[0])
 
-        # Upcast reduced-precision inputs to float32 for computation
-        u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
         E0_f32 = (self.E0_elem_gpu.astype(cp.float32)
                   if self.E0_elem_gpu.dtype != cp.float32
                   else self.E0_elem_gpu)
 
-        # Average von Mises strain per element (over 8 Gauss points)
-        eps_vm_avg = compute_avg_strain_per_element(
-            u_f32, self.B_gauss_gpu, self.Ny, self.Nz, Ne,
-            chunk_size=self.chunk_size
-        )
+        if self.constitutive.model == "linear":
+            # E_t = E0 for every strain state — skip the per-element average
+            # strain kernel entirely (it's O(N) work whose result is unused).
+            E_t = E0_f32
+        else:
+            u_f32 = u_gpu.astype(cp.float32) if u_gpu.dtype != cp.float32 else u_gpu
 
-        # Tangent modulus at current state
-        E_t = self.constitutive.tangent_modulus(E0_f32, eps_vm_avg)
+            # Average von Mises strain per element (over 8 Gauss points)
+            eps_vm_avg = compute_avg_strain_per_element(
+                u_f32, self.B_gauss_gpu, self.Ny, self.Nz, Ne,
+                chunk_size=self.chunk_size
+            )
+
+            # Tangent modulus at current state
+            E_t = self.constitutive.tangent_modulus(E0_f32, eps_vm_avg)
 
         # Map to uint8 relative to E_max for coarsening
         E_t_cpu = cp.asnumpy(E_t)
@@ -127,9 +130,11 @@ class NonlinearMultigrid:
         if int(E_t_voxels.max()) == 0:
             E_t_voxels = self.base_voxels.copy()
 
-        # Free old hierarchy before building the new one so they don't coexist.
-        del self._gmg
-        cp.get_default_memory_pool().free_all_blocks()
+        # Free old hierarchy (if any) before building the new one so they
+        # don't coexist.
+        if self._gmg is not None:
+            del self._gmg
+            cp.get_default_memory_pool().free_all_blocks()
 
         self._gmg = GeometricMultigrid(
             E_t_voxels, self.nu, self.E_max, 0.0,

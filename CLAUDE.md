@@ -254,6 +254,21 @@ uint8 image, and rebuilds the `GeometricMultigrid` hierarchy (passing the stored
 **entirely on the GPU** and `apply()` consumes/returns a CuPy residual with no
 host round-trip per PCG iteration.
 
+**Hierarchy construction is lazy**: `__init__` does not build a `GeometricMultigrid`
+— `update()` is always called before the first `apply()` (once per NR iteration,
+or once for `is_linear`), so an `__init__`-time build would just be discarded
+unused. `_gmg` starts as `None`; `update()` builds it on first call and rebuilds
+it thereafter. `set_bc_mask()` stores `bc_mask` and only forwards it to `_gmg`
+if a hierarchy already exists.
+
+**`update()` skips the strain kernel for `constitutive.model == "linear"`**:
+`E_t ≡ E0` regardless of strain for the linear model, so
+`compute_avg_strain_per_element` (an O(N) kernel over all elements × 8 Gauss
+points) is skipped entirely and `E_t = E0_elem` is used directly. This removes
+the dominant pre-PCG cost for `is_linear=True` solves (e.g. `simulateCT.py`),
+which scales with element count and otherwise computes a strain field that is
+provably unused.
+
 `preconditioner="multigrid"` is now working. On the layered example it converges
 in a near grid-independent ~20–30 PCG iterations vs Jacobi's O(N) (e.g. 40³
 parallel case: 31 vs 1083). Correctness is locked in by `tests/test_multigrid.py`
