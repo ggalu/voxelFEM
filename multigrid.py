@@ -88,7 +88,10 @@ class GridLevel:
         self._void_dofs_np = np.where(zero_diag_cpu)[0].astype(np.int32)
 
         diag = xp.where(zero_diag_bool, xp.asarray(1.0, dtype=diag.dtype), diag)
-        self.diag_inv = (1.0 / diag).astype(np.float32)
+        diag_inv = (1.0 / diag).astype(np.float32)
+        # GPU: store as float16 (read-only multiplicative smoother factor,
+        # promoted back to float32 when combined with float32 residuals).
+        self.diag_inv = diag_inv.astype(xp.float16) if xp is not np else diag_inv
 
         # bc_mask holds the union of Dirichlet + void-only DOF indices (identity
         # rows in matvec); initialised here, extended by set_bc().

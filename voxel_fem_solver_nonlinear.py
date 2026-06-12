@@ -29,11 +29,11 @@ GPU memory (300M elements, 48 GB VRAM):
   E0_elem (float16):                   0.6 GB
   u, x/Δu, p, r, z (float32):       21.6 GB   (6 arrays × 3.6 GB)
   f_int/R, Ap (float32):             7.2 GB   (2 arrays × 3.6 GB)
-  MG fine diagonal (float32):        3.6 GB
-  MG coarse diagonals:               0.5 GB
+  MG fine diagonal (float16):        1.8 GB
+  MG coarse diagonals:               0.25 GB
   Chunk working buffers (2M chunk): ~1.0 GB
   CuPy pool cache:                  ~1.0 GB
-  Total:                            ~31.4 GB ✓ (16.6 GB headroom at 48 GB)
+  Total:                            ~29.5 GB ✓ (18.5 GB headroom at 48 GB)
 
 Example
 -------
@@ -309,7 +309,7 @@ class VoxelFEMSolverNonlinear:
                     + np.array([0, 1, 2], dtype=np.int32)).reshape(-1, 24)
         diag = build_diagonal(E0_cpu, conn_dof, K_ref, self.Ndof)
         diag = np.where(diag < 1e-12, 1.0, diag)
-        diag_inv_gpu = cp.asarray((1.0 / diag).astype(np.float32))
+        diag_inv_gpu = cp.asarray((1.0 / diag).astype(np.float32)).astype(cp.float16)
         # Inactive DOFs (void-only nodes) must not be corrected by the
         # preconditioner — set their inverse diagonal to 1 (identity).
         if (self.inactive_dofs_gpu is not None
