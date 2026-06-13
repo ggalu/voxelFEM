@@ -84,7 +84,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "displacement",
-        help="Displacement field file (.npy, shape (3, Nx, Ny, Nz), in voxels)."
+        nargs='?',
+        default=None,
+        help="Displacement field file (.npy, shape (3, Nx, Ny, Nz), in voxels). "
+             "Ignored if --test is passed."
     )
     parser.add_argument(
         "--image-key",
@@ -117,6 +120,12 @@ if __name__ == "__main__":
         action="store_true",
         help="If set, assume displacement shape is (Nx, Ny, Nz, 3), not (3, Nx, Ny, Nz)."
     )
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Generate a synthetic displacement field (1%% uniaxial strain in x direction). "
+             "Displacement argument is ignored if --test is passed."
+    )
 
     args = parser.parse_args()
 
@@ -130,9 +139,24 @@ if __name__ == "__main__":
         image_np = np.load(args.image)
         print(f"Loaded image from {args.image}, shape {image_np.shape}, dtype {image_np.dtype}")
 
-    # Load displacement field
-    u_np = np.load(args.displacement)
-    print(f"Loaded displacement from {args.displacement}, shape {u_np.shape}, dtype {u_np.dtype}")
+    # Load or generate displacement field
+    if args.test:
+        # Generate synthetic displacement field: 1% uniaxial strain in x direction
+        Nx, Ny, Nz = image_np.shape
+        xx = np.arange(Nx + 1, dtype=np.float32)
+        yy = np.arange(Ny + 1, dtype=np.float32)
+        zz = np.arange(Nz + 1, dtype=np.float32)
+        xx_grid, yy_grid, zz_grid = np.meshgrid(xx, yy, zz, indexing='ij')
+
+        # Affine strain: u_x = 0.01 * x, u_y = 0, u_z = 0
+        u_np = np.zeros((3, Nx + 1, Ny + 1, Nz + 1), dtype=np.float32)
+        u_np[0] = 0.01 * xx_grid
+        print(f"Generated synthetic displacement (1%% x-strain), shape {u_np.shape}, dtype {u_np.dtype}")
+    else:
+        if args.displacement is None:
+            raise ValueError("displacement argument required unless --test is passed")
+        u_np = np.load(args.displacement)
+        print(f"Loaded displacement from {args.displacement}, shape {u_np.shape}, dtype {u_np.dtype}")
 
     # Handle axis ordering: convert (Nx, Ny, Nz, 3) to (3, Nx, Ny, Nz) if needed
     if args.disp_axis_last or (u_np.ndim == 4 and u_np.shape[-1] == 3):
