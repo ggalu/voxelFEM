@@ -131,15 +131,20 @@ def build_affine_u0(Nx, Ny, Nz, strain, nu, axis):
 
     This is the exact solution for a uniform material and a good first guess
     for heterogeneous media, reducing the initial residual substantially.
+
+    Built directly on the GPU (CuPy) — for large grids the host-side
+    `np.mgrid` + assembly is a multi-second, single-threaded CPU step that
+    runs while the GPU sits idle.
     """
     Ndof = 3 * (Nx + 1) * (Ny + 1) * (Nz + 1)
-    u0 = np.zeros(Ndof, dtype=np.float32)
+    u0 = cp.zeros(Ndof, dtype=cp.float32)
 
     # C-order node indexing: flat node i has coordinates given by mgrid
-    ii, jj, kk = np.mgrid[0:Nx+1, 0:Ny+1, 0:Nz+1]
-    coords = [ii.ravel().astype(np.float32),
-              jj.ravel().astype(np.float32),
-              kk.ravel().astype(np.float32)]
+    ii, jj, kk = cp.meshgrid(cp.arange(Nx + 1, dtype=cp.float32),
+                             cp.arange(Ny + 1, dtype=cp.float32),
+                             cp.arange(Nz + 1, dtype=cp.float32),
+                             indexing='ij')
+    coords = [ii.ravel(), jj.ravel(), kk.ravel()]
 
     u0[axis::3] = strain * coords[axis]
     for d in range(3):
@@ -313,7 +318,7 @@ def main():
     # --- Affine initial displacement field -----------------------------------
     u0 = build_affine_u0(Nx, Ny, Nz, args["strain"], args["nu"], axis)
     print(f"\n  Affine u0 seeded  : {aname}-displ range "
-          f"[{u0[axis::3].min():.4f}, {u0[axis::3].max():.4f}]")
+          f"[{float(u0[axis::3].min()):.4f}, {float(u0[axis::3].max()):.4f}]")
 
     # --- Solve ---------------------------------------------------------------
     t0 = time.perf_counter()
@@ -380,6 +385,28 @@ def main():
     npy_path = args["vtk"] if args["vtk"].endswith(".npy") else args["vtk"] + "_results.npy"
     np.save(npy_path, results)
     print(f"  Wrote effective stress and strain: {npy_path}")
+
+    # --- Save displacement field as 3D numpy array (nodes × components) --------
+    # Reshape from (Ndof,) to (Nx+1, Ny+1, Nz+1, 3) where last axis is [ux, uy, uz]
+    #
+    # NOTE: The displacement field is defined at the FEM nodes, which form a
+    # grid of size (Nx+1, Ny+1, Nz+1) for a voxel domain of size (Nx, Ny, Nz).
+    # Thus the displacement array is **one voxel larger in each direction** than
+    # the input intensity/voxel data.
+    #
+    # If displacements at voxel centers (i.e., corresponding to the gray-level
+    # intensities in the input .npz file) are required, they must be obtained by
+    # **linear interpolation** of the nodal displacements. This is consistent with
+    # the trilinear shape functions used in the voxel FEM scheme (each voxel is a
+    # Q1 hex element). The warp_cupy.py utility provides this interpolation:
+    #
+    #     python warp_cupy.py input.npz ct_result_displacement.npy \
+    #            --image-key intensity --disp-axis-last --output warped.npy
+    #
+    u_reshaped = u.reshape((Nx + 1, Ny + 1, Nz + 1, 3)).astype(np.float32)
+    disp_path = args["vtk"] if args["vtk"].endswith(".npy") else args["vtk"] + "_displacement.npy"
+    np.save(disp_path, u_reshaped)
+    print(f"  Wrote displacement field: {disp_path}")
 
     print(f"\n{'='*70}")
     print("  Simulation complete.")

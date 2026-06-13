@@ -253,9 +253,8 @@ class VoxelFEMSolverNonlinear:
                 self.solid_elem_gpu, self.Ny, self.Nz, self.Ndof,
                 chunk_size=gpu_chunk_size,
             )
-            inactive_np = np.where(~cp.asnumpy(active_dof_gpu))[0].astype(np.int32)
-            self.inactive_dofs_gpu = cp.asarray(inactive_np)
-            del active_dof_gpu, inactive_np
+            self.inactive_dofs_gpu = cp.where(~active_dof_gpu)[0].astype(cp.int32)
+            del active_dof_gpu
             if verbose:
                 n_solid = int(cp.count_nonzero(self.solid_elem_gpu))
                 n_inact = int(self.inactive_dofs_gpu.shape[0])
@@ -546,7 +545,6 @@ class VoxelFEMSolverNonlinear:
                   f"(rel = {R_norm/f_norm_ref:.3e})  "
                   f"PCG tol = {self.tol_pcg:.1e}")
 
-        # Build preconditioner once (no update needed — K is constant for linear)
         self._precond.update(u_gpu)
 
         def _matvec(v, _u=u_gpu):
@@ -587,44 +585,48 @@ class VoxelFEMSolverNonlinear:
         self._islands_checked = True
 
         try:
-            from scipy import ndimage
+            import cupyx.scipy.ndimage as cpx_ndimage
         except ImportError:
             if self.verbose:
-                print("WARNING: scipy not available; floating-island check skipped.")
+                print("WARNING: cupyx.scipy.ndimage not available; "
+                      "floating-island check skipped.")
             return 0, 0, []
 
-        solid_3d = self._solid_mask_np.reshape(self.Nx, self.Ny, self.Nz)
+        solid_3d = cp.asarray(
+            self._solid_mask_np.reshape(self.Nx, self.Ny, self.Nz)
+        )
         # Use 26-connectivity: elements sharing even a corner share DOFs.
-        labeled, n_comps = ndimage.label(solid_3d, structure=np.ones((3, 3, 3)))
+        structure = cp.ones((3, 3, 3), dtype=cp.uint8)
+        labeled, n_comps = cpx_ndimage.label(solid_3d, structure=structure)
         if n_comps == 0:
             return 0, 0, []
 
         # Which nodes have at least one constrained DOF?
         Nn = (self.Nx + 1) * (self.Ny + 1) * (self.Nz + 1)
-        constrained_node = np.zeros(Nn, dtype=bool)
-        constrained_node[bc_dofs_np // 3] = True
+        constrained_node = cp.zeros(Nn, dtype=bool)
+        constrained_node[cp.asarray(bc_dofs_np) // 3] = True
         cn3d = constrained_node.reshape(self.Nx + 1, self.Ny + 1, self.Nz + 1)
 
         # An element is "anchored" iff any of its 8 corner nodes is constrained.
-        ix = np.arange(self.Nx)[:, None, None]
-        iy = np.arange(self.Ny)[None, :, None]
-        iz = np.arange(self.Nz)[None, None, :]
         anchored = (
-            cn3d[ix,   iy,   iz  ] | cn3d[ix+1, iy,   iz  ] |
-            cn3d[ix,   iy+1, iz  ] | cn3d[ix+1, iy+1, iz  ] |
-            cn3d[ix,   iy,   iz+1] | cn3d[ix+1, iy,   iz+1] |
-            cn3d[ix,   iy+1, iz+1] | cn3d[ix+1, iy+1, iz+1]
+            cn3d[:-1, :-1, :-1] | cn3d[1:, :-1, :-1] |
+            cn3d[:-1, 1:, :-1] | cn3d[1:, 1:, :-1] |
+            cn3d[:-1, :-1, 1:] | cn3d[1:, :-1, 1:] |
+            cn3d[:-1, 1:, 1:] | cn3d[1:, 1:, 1:]
         )  # (Nx, Ny, Nz) bool
 
         # Mark components that contain at least one anchored solid element.
         solid_and_anchored = solid_3d & anchored
-        anchored_comps = set(np.unique(labeled[solid_and_anchored]))
+        anchored_comps = set(cp.asnumpy(cp.unique(labeled[solid_and_anchored])).tolist())
         anchored_comps.discard(0)
 
-        floating_sizes = []
-        for cid in range(1, n_comps + 1):
-            if cid not in anchored_comps:
-                floating_sizes.append(int((labeled == cid).sum()))
+        # Per-component element counts in one pass (avoids an O(n_comps · Ne)
+        # loop, which dominates for data with many small disconnected islands,
+        # e.g. fibrous CT microstructures with thousands of fibre segments).
+        sizes = cp.asnumpy(cp.bincount(labeled.ravel(), minlength=n_comps + 1))
+
+        floating_sizes = [int(sizes[cid]) for cid in range(1, n_comps + 1)
+                          if cid not in anchored_comps]
 
         if floating_sizes:
             total = sum(floating_sizes)
