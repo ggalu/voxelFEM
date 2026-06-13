@@ -180,6 +180,10 @@ if __name__ == "__main__":
     print(f"Warped shape: {warped_np.shape}, dtype: {warped_np.dtype}")
     print(f"Warped range: {warped_np.min()} to {warped_np.max()}")
 
+    # Save original intensity at original coordinates
+    np.save("original_intensity.npy", image_np)
+    print(f"Saved original intensity to original_intensity.npy")
+
     if args.output is not None:
         np.save(args.output, warped_np)
         print(f"Saved warped image to {args.output}")
