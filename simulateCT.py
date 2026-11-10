@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 # @Author: Georg C. Ganzenmueller, Albert-Ludwigs Universitaet Freiburg, Germany
 # @Date:   2026-06-04 21:15:10
+# @Modified by: Lokesh Metta, Albert-Ludwigs Universitaet Freiburg, Germany
+# @Modified:     2026-09-25 (comments: use warp_cupy.warp_lagrangian for ground-truth images)
 #!/usr/bin/env python
 """
 Voxel FEM simulation of a CT-segmented sample
@@ -398,10 +400,17 @@ def main():
     # intensities in the input .npz file) are required, they must be obtained by
     # **linear interpolation** of the nodal displacements. This is consistent with
     # the trilinear shape functions used in the voxel FEM scheme (each voxel is a
-    # Q1 hex element). The warp_cupy.py utility provides this interpolation:
+    # Q1 hex element).
+    #
+    # To make the deformed image of a ground truth from this nodal field, use
+    # warp_cupy.py (since 2026-09-25 it solves X + u(X) = y exactly and samples
+    # the image with a cubic B-spline; node index = image coordinate):
     #
     #     python warp_cupy.py input.npz ct_result_displacement.npy \
-    #            --image-key intensity --disp-axis-last --output warped.npy
+    #            --image-key intensity --output deformed.npy
+    #
+    # (--legacy-pull gives the old first-order pull warp with node-to-voxel-
+    # centre averaging; do not use it for ground-truth images.)
     #
     u_reshaped = u.reshape((Nx + 1, Ny + 1, Nz + 1, 3)).astype(np.float32)
     disp_path = args["vtk"] if args["vtk"].endswith(".npy") else args["vtk"] + "_displacement.npy"
