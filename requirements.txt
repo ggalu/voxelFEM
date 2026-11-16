@@ -1,0 +1,12 @@
+# Solver (required)
+numpy>=1.24
+cupy-cuda12x>=12.0   # choose the CuPy package that matches your CUDA version
+
+# Tests
+pytest>=7.0
+
+# Optional, needed by individual scripts
+pyvista>=0.44        # .vti export (vtk_export.save_stress_strain_vti, simulateCT.py, examples)
+matplotlib>=3.7      # preprocess.py, crop_numpy_array.py
+scipy>=1.10          # preprocess_smooth.py, tests/test_warp_lagrangian.py
+# napari             # view.py

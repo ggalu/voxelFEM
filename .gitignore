@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Generated simulation output (see clean_artifacts.sh)
+*.npy
+*.vti
+*.vtk
+histogram_modulus.txt
+histogram_plot.png
+
+# Local data: only the sample under assets/ belongs in the repository
+*.npz
+!assets/PA66GF30.npz
+
+# Local tool settings
+.claude/
+
+# Local material that is not part of the release
+CLAUDE.md
+napari_compare.py
+microstructpy/
+thesis-Keszler.pdf
+*.npy.json
