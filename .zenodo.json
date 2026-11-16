@@ -1,0 +1,32 @@
+{
+  "title": "voxelFEM: a matrix-free GPU finite-element solver for elasticity on voxel grids",
+  "upload_type": "software",
+  "version": "v1.0.0",
+  "license": "MIT",
+  "description": "<p>voxelFEM is a finite-element solver for linear and nonlinear elasticity on voxel grids, written in Python with CuPy and run on one CUDA GPU. Every voxel is one trilinear hexahedral element, so a segmented CT scan or another 3-D image is simulated without meshing. The solver assembles no stiffness matrix and stores no element connectivity. It uses a Newton-Raphson iteration with load stepping, a preconditioned conjugate gradient method, and a Jacobi or a geometric multigrid preconditioner.</p><p>Scripts map CT grey levels to a Young's modulus field, compute the effective modulus of a scan, and generate deformed images from the computed displacement field. A small sample CT volume of a glass-fibre reinforced polyamide is included.</p>",
+  "creators": [
+    {
+      "name": "Ganzenmüller, Georg C.",
+      "affiliation": "Institute of Sustainable Systems Engineering (INATECH), University of Freiburg, Freiburg, Germany",
+      "orcid": "0000-0001-5741-8844"
+    }
+  ],
+  "contributors": [
+    {
+      "name": "Metta, Lokesh",
+      "affiliation": "University of Freiburg, Freiburg, Germany",
+      "type": "Other"
+    }
+  ],
+  "keywords": [
+    "finite element method", "voxel", "matrix-free", "GPU", "CuPy", "multigrid",
+    "computed tomography", "elasticity", "homogenisation"
+  ],
+  "related_identifiers": [
+    {
+      "identifier": "https://github.com/ggalu/voxelFEM",
+      "relation": "isSupplementTo",
+      "scheme": "url"
+    }
+  ]
+}

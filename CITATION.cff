@@ -1,0 +1,37 @@
+# Citation metadata. GitHub reads this file for its "Cite this repository" button.
+# Zenodo takes the metadata of each release from .zenodo.json; keep the two files in step.
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "voxelFEM: a matrix-free GPU finite-element solver for elasticity on voxel grids"
+abstract: >-
+  voxelFEM is a finite-element solver for linear and nonlinear elasticity on voxel grids,
+  written in Python with CuPy and run on one CUDA GPU. Every voxel is one trilinear
+  hexahedral element, so a segmented CT scan or another 3-D image is simulated without
+  meshing. The solver assembles no stiffness matrix and stores no element connectivity. It
+  uses a Newton-Raphson iteration with load stepping, a preconditioned conjugate gradient
+  method, and a Jacobi or a geometric multigrid preconditioner. Scripts map CT grey levels
+  to a Young's modulus field, compute the effective modulus of a scan, and generate
+  deformed images from the computed displacement field.
+authors:
+  - family-names: "Ganzenmüller"
+    given-names: "Georg C."
+    email: georg.ganzenmueller@inatech.uni-freiburg.de
+    orcid: "https://orcid.org/0000-0001-5741-8844"
+    affiliation: >-
+      Institute of Sustainable Systems Engineering (INATECH), University of Freiburg,
+      Freiburg, Germany
+repository-code: "https://github.com/ggalu/voxelFEM"
+license: MIT
+keywords:
+  - finite element method
+  - voxel
+  - matrix-free
+  - GPU
+  - CuPy
+  - multigrid
+  - computed tomography
+  - elasticity
+  - homogenisation
+version: "v1.0.0"
+date-released: "2026-11-16"
