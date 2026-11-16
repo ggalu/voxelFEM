@@ -1,5 +1,7 @@
 # voxelFEM
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24288861.svg)](https://doi.org/10.5281/zenodo.24288861)
+
 A matrix-free finite-element solver for elasticity on voxel grids, running on the
 GPU. Every voxel is one trilinear hexahedral (Q1) element, so a segmented CT scan
 or any other 3-D image can be simulated directly, without meshing.
@@ -232,6 +234,13 @@ would lose all accuracy.
 ## License
 
 Released under the MIT License; see [LICENSE](LICENSE).
+
+## Citing
+
+Each release is archived on Zenodo. To cite the software, use the DOI
+[10.5281/zenodo.24288861](https://doi.org/10.5281/zenodo.24288861), which always
+resolves to the latest version; the Zenodo page also lists a separate DOI for
+each version. `CITATION.cff` holds the citation metadata.
 
 ## Authors
 

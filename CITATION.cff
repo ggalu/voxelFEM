@@ -1,5 +1,6 @@
 # Citation metadata. GitHub reads this file for its "Cite this repository" button.
 # Zenodo takes the metadata of each release from .zenodo.json; keep the two files in step.
+# The DOI is the concept DOI of Zenodo, which resolves to the latest version.
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below."
 type: software
@@ -21,6 +22,7 @@ authors:
     affiliation: >-
       Institute of Sustainable Systems Engineering (INATECH), University of Freiburg,
       Freiburg, Germany
+doi: 10.5281/zenodo.24288861
 repository-code: "https://github.com/ggalu/voxelFEM"
 license: MIT
 keywords:
