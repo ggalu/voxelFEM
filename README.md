@@ -244,7 +244,9 @@ each version. `CITATION.cff` holds the citation metadata.
 
 ## Authors
 
-Georg C. Ganzenmüller, Albert-Ludwigs-Universität Freiburg, Germany.
+Georg C. Ganzenmüller, Institute of Sustainable Systems Engineering (INATECH),
+University of Freiburg, and Fraunhofer Institute for High-Speed Dynamics,
+Ernst-Mach-Institut, EMI, Freiburg, Germany.
 
 Lokesh Metta, Albert-Ludwigs-Universität Freiburg, Germany, contributed the
 Lagrangian warp in `warp_cupy.py` and its tests.

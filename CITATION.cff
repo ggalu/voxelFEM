@@ -21,7 +21,8 @@ authors:
     orcid: "https://orcid.org/0000-0001-5741-8844"
     affiliation: >-
       Institute of Sustainable Systems Engineering (INATECH), University of Freiburg,
-      Freiburg, Germany
+      Freiburg, Germany; Fraunhofer Institute for High-Speed Dynamics,
+      Ernst-Mach-Institut, EMI, Freiburg, Germany
 doi: 10.5281/zenodo.24288861
 repository-code: "https://github.com/ggalu/voxelFEM"
 license: MIT
